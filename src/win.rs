@@ -39,6 +39,119 @@ pub const CTRL_CLOSE_EVENT: DWORD = 2;
 
 pub type PHANDLER_ROUTINE = Option<unsafe extern "system" fn(CtrlType: DWORD) -> BOOL>;
 
+pub type HWND = *mut c_void;
+pub type WPARAM = usize;
+pub type LPARAM = isize;
+pub type LRESULT = isize;
+pub type WNDPROC = Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>;
+
+/// Parent handle that makes a window message-only.
+pub const HWND_MESSAGE: HWND = -3isize as HWND;
+
+pub const WM_DESTROY: u32 = 0x0002;
+pub const WM_CLOSE: u32 = 0x0010;
+pub const WM_QUERYENDSESSION: u32 = 0x0011;
+pub const WM_ENDSESSION: u32 = 0x0016;
+pub const WM_DEVICECHANGE: u32 = 0x0219;
+pub const WM_APP: u32 = 0x8000;
+
+pub const DBT_DEVICEARRIVAL: WPARAM = 0x8000;
+pub const DBT_DEVICEREMOVECOMPLETE: WPARAM = 0x8004;
+pub const DBT_DEVTYP_DEVICEINTERFACE: DWORD = 5;
+pub const DEVICE_NOTIFY_WINDOW_HANDLE: DWORD = 0;
+
+#[repr(C)]
+pub struct WNDCLASSW {
+    pub style: u32,
+    pub lpfnWndProc: WNDPROC,
+    pub cbClsExtra: i32,
+    pub cbWndExtra: i32,
+    pub hInstance: HANDLE,
+    pub hIcon: HANDLE,
+    pub hCursor: HANDLE,
+    pub hbrBackground: HANDLE,
+    pub lpszMenuName: *const u16,
+    pub lpszClassName: *const u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct POINT {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[repr(C)]
+pub struct MSG {
+    pub hwnd: HWND,
+    pub message: u32,
+    pub wParam: WPARAM,
+    pub lParam: LPARAM,
+    pub time: DWORD,
+    pub pt: POINT,
+}
+
+#[repr(C)]
+pub struct DEV_BROADCAST_HDR {
+    pub dbch_size: DWORD,
+    pub dbch_devicetype: DWORD,
+    pub dbch_reserved: DWORD,
+}
+
+#[repr(C)]
+pub struct DEV_BROADCAST_DEVICEINTERFACE_W {
+    pub dbcc_size: DWORD,
+    pub dbcc_devicetype: DWORD,
+    pub dbcc_reserved: DWORD,
+    pub dbcc_classguid: GUID,
+    pub dbcc_name: [u16; 1],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SYSTEMTIME {
+    pub wYear: u16,
+    pub wMonth: u16,
+    pub wDayOfWeek: u16,
+    pub wDay: u16,
+    pub wHour: u16,
+    pub wMinute: u16,
+    pub wSecond: u16,
+    pub wMilliseconds: u16,
+}
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn RegisterClassW(lpWndClass: *const WNDCLASSW) -> u16;
+    pub fn CreateWindowExW(
+        dwExStyle: DWORD,
+        lpClassName: *const u16,
+        lpWindowName: *const u16,
+        dwStyle: DWORD,
+        X: i32,
+        Y: i32,
+        nWidth: i32,
+        nHeight: i32,
+        hWndParent: HWND,
+        hMenu: HANDLE,
+        hInstance: HANDLE,
+        lpParam: *mut c_void,
+    ) -> HWND;
+    pub fn DestroyWindow(hWnd: HWND) -> BOOL;
+    pub fn DefWindowProcW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
+    pub fn GetMessageW(lpMsg: *mut MSG, hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32) -> BOOL;
+    pub fn TranslateMessage(lpMsg: *const MSG) -> BOOL;
+    pub fn DispatchMessageW(lpMsg: *const MSG) -> LRESULT;
+    pub fn PostMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> BOOL;
+    pub fn PostQuitMessage(nExitCode: i32);
+    pub fn RegisterDeviceNotificationW(
+        hRecipient: HANDLE,
+        NotificationFilter: *mut c_void,
+        Flags: DWORD,
+    ) -> HANDLE;
+    pub fn UnregisterDeviceNotification(Handle: HANDLE) -> BOOL;
+}
+
 pub const DIGCF_PRESENT: DWORD = 0x0000_0002;
 pub const DIGCF_DEVICEINTERFACE: DWORD = 0x0000_0010;
 
@@ -167,4 +280,6 @@ extern "system" {
         bWait: BOOL,
     ) -> BOOL;
     pub fn SetConsoleCtrlHandler(HandlerRoutine: PHANDLER_ROUTINE, Add: BOOL) -> BOOL;
+    pub fn GetModuleHandleW(lpModuleName: *const u16) -> HANDLE;
+    pub fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
 }

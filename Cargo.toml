@@ -7,6 +7,14 @@ license = "MIT"
 
 [dependencies]
 
+[[bin]]
+name = "ezrama"
+path = "src/main.rs"
+
+[[bin]]
+name = "ezramaw"
+path = "src/bin/ezramaw.rs"
+
 [profile.release]
 opt-level = "z"
 lto = true
