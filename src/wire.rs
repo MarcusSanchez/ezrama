@@ -270,7 +270,7 @@ impl DeviceInformation {
                 (4, Value::Len(b)) => info.product_name = text(b),
                 (5, Value::Len(b)) => info.app_version = text(b),
                 (8, Value::Len(b)) => info.serial_number = text(b),
-                (9, value) => info.serial_number_locked = value.as_u64() == Some(1),
+                (9, value) => info.serial_number_locked = truthy(value),
                 (10, Value::Len(b)) => info.chip_id = text(b),
                 _ => {}
             }
@@ -420,7 +420,7 @@ fn parse_standby(body: &[u8]) -> Result<StandbyConfiguration, DecodeError> {
     for field in Fields::new(body) {
         let field = field?;
         match (field.number, field.value) {
-            (1, value) => config.enable = value.as_u64() == Some(1),
+            (1, value) => config.enable = truthy(value),
             (2, Value::Len(bytes)) => config.media_file = text(bytes),
             _ => {}
         }
@@ -466,9 +466,9 @@ fn parse_display(body: &[u8]) -> Result<DisplayConfiguration, DecodeError> {
             continue;
         };
         match field.number {
-            1 => config.backlight_enable = value == 1,
+            1 => config.backlight_enable = value != 0,
             2 => config.backlight_brightness = value,
-            3 => config.mirror = value == 1,
+            3 => config.mirror = value != 0,
             4 => config.ui_rotation = value,
             5 => config.media_rotation = value,
             _ => {}
@@ -479,6 +479,11 @@ fn parse_display(body: &[u8]) -> Result<DisplayConfiguration, DecodeError> {
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Protobuf booleans are varints where any non-zero value is true.
+fn truthy(value: Value<'_>) -> bool {
+    value.as_u64().is_some_and(|v| v != 0)
 }
 
 #[cfg(test)]
@@ -753,6 +758,18 @@ mod tests {
         assert_eq!(LoopMode::from(1), LoopMode::All);
         assert_eq!(LoopMode::from(2), LoopMode::Random);
         assert_eq!(LoopMode::from(9), LoopMode::Unknown(9));
+    }
+
+    #[test]
+    fn booleans_accept_any_non_zero_value() {
+        let info = Message::new().uint(9, 2).into_bytes();
+        assert!(DeviceInformation::parse(&info).unwrap().serial_number_locked);
+        let display = Message::new().uint(1, 200).uint(3, 7).into_bytes();
+        let parsed = parse_display(&display).unwrap();
+        assert!(parsed.backlight_enable);
+        assert!(parsed.mirror);
+        let standby = Message::new().uint(1, 0).into_bytes();
+        assert!(!parse_standby(&standby).unwrap().enable);
     }
 
     #[test]
