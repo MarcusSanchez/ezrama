@@ -453,13 +453,6 @@ pub struct PROCESSENTRY32W {
 #[link(name = "shell32")]
 extern "system" {
     pub fn Shell_NotifyIconW(dwMessage: DWORD, lpData: *mut NOTIFYICONDATAW) -> BOOL;
-    pub fn ExtractIconExW(
-        lpszFile: *const u16,
-        nIconIndex: i32,
-        phiconLarge: *mut HICON,
-        phiconSmall: *mut HICON,
-        nIcons: u32,
-    ) -> u32;
 }
 
 #[link(name = "user32")]

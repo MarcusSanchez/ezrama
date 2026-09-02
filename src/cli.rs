@@ -604,7 +604,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
         Some(path) => log.log(&format!("KANALI found at {}", path.display())),
         None => log.log("KANALI not found; the menu cannot start it"),
     }
-    let icon = match tray::boxed_program_icon(kanali.as_deref()) {
+    let icon = match tray::app_icon() {
         Ok(icon) => Some(icon),
         Err(error) => {
             log.log(&format!("notification icon unavailable: {error}"));

@@ -1,13 +1,11 @@
-//! The notification-area icon: an icon handle built from pixels, another
-//! program's icon read back as pixels, the entry itself, and its pop-up
-//! menu.
+//! The notification-area icon: an icon handle built from pixels, the entry
+//! itself, and its pop-up menu.
 
 use std::ffi::c_void;
 use std::mem;
-use std::path::Path;
 use std::ptr;
 
-use crate::icon::{boxed, layout, Image};
+use crate::icon::Image;
 use crate::usbprint::{wide, WinError};
 use crate::win::*;
 
@@ -107,102 +105,9 @@ pub fn create_icon(image: &Image) -> Result<Icon, WinError> {
     Ok(Icon { handle })
 }
 
-/// Reads a square bitmap back as pixels.
-fn bitmap_pixels(dc: HDC, bitmap: HBITMAP) -> Option<Image> {
-    let mut info = bitmap_info(0);
-    info.bmiHeader.biBitCount = 0;
-    let probed = unsafe { GetDIBits(dc, bitmap, 0, 0, ptr::null_mut(), &mut info, DIB_RGB_COLORS) };
-    let (width, height) = (info.bmiHeader.biWidth, info.bmiHeader.biHeight.abs());
-    if probed == 0 || width <= 0 || width != height {
-        return None;
-    }
-    let mut info = bitmap_info(width);
-    let mut pixels = vec![0u32; (width * height) as usize];
-    let read = unsafe {
-        GetDIBits(
-            dc,
-            bitmap,
-            0,
-            height as u32,
-            pixels.as_mut_ptr() as *mut c_void,
-            &mut info,
-            DIB_RGB_COLORS,
-        )
-    };
-    if read == 0 {
-        return None;
-    }
-    Image::from_pixels(width as usize, pixels)
-}
-
-/// The pixels of an icon handle. An icon without an alpha channel gets one
-/// from its mask.
-fn icon_pixels(icon: HICON) -> Option<Image> {
-    let mut info: ICONINFO = unsafe { mem::zeroed() };
-    if unsafe { GetIconInfo(icon, &mut info) } == 0 {
-        return None;
-    }
-    let dc = unsafe { GetDC(ptr::null_mut()) };
-    let color = if info.hbmColor.is_null() {
-        None
-    } else {
-        bitmap_pixels(dc, info.hbmColor)
-    };
-    let image = color.map(|color| {
-        if color.has_alpha() {
-            return color;
-        }
-        match bitmap_pixels(dc, info.hbmMask) {
-            Some(mask) if mask.size == color.size => color.with_mask(&mask),
-            _ => color.with_mask(&Image::blank(color.size)),
-        }
-    });
-    unsafe {
-        ReleaseDC(ptr::null_mut(), dc);
-        if !info.hbmColor.is_null() {
-            DeleteObject(info.hbmColor);
-        }
-        if !info.hbmMask.is_null() {
-            DeleteObject(info.hbmMask);
-        }
-    }
-    image
-}
-
-/// The first icon of the program at `path`: whichever of the program's
-/// small and large renderings is the smaller one still at least `size`
-/// pixels, or the largest available.
-pub fn program_icon(path: &Path, size: usize) -> Option<Image> {
-    let file = wide(&path.to_string_lossy());
-    let mut large: HICON = ptr::null_mut();
-    let mut small: HICON = ptr::null_mut();
-    let count = unsafe { ExtractIconExW(file.as_ptr(), 0, &mut large, &mut small, 1) };
-    if count == 0 {
-        return None;
-    }
-    let mut candidates: Vec<Image> = [small, large]
-        .into_iter()
-        .filter(|icon| !icon.is_null())
-        .filter_map(|icon| {
-            let image = icon_pixels(icon);
-            unsafe {
-                DestroyIcon(icon);
-            }
-            image
-        })
-        .collect();
-    candidates.sort_by_key(|image| image.size);
-    let fitting = candidates.iter().position(|image| image.size >= size);
-    let chosen = fitting.unwrap_or(candidates.len().checked_sub(1)?);
-    Some(candidates.swap_remove(chosen))
-}
-
-/// The icon for the notification area at the size it draws: the box, with
-/// the icon of the program at `program` on its front when there is one.
-pub fn boxed_program_icon(program: Option<&Path>) -> Result<Icon, WinError> {
-    let size = small_icon_size();
-    let label = program.and_then(|path| program_icon(path, layout(size).label));
-    create_icon(&boxed(size, label.as_ref()))
+/// The program's icon at the size the notification area draws.
+pub fn app_icon() -> Result<Icon, WinError> {
+    create_icon(&Image::embedded().resample(small_icon_size()))
 }
 
 /// The notification-area entry for a window.
@@ -342,7 +247,51 @@ impl Drop for Menu {
 mod tests {
     use super::*;
     use crate::icon;
-    use crate::launcher::kanali_path;
+
+    /// Reads a square bitmap back as pixels.
+    fn bitmap_pixels(dc: HDC, bitmap: HBITMAP) -> Option<Image> {
+        let mut info = bitmap_info(0);
+        info.bmiHeader.biBitCount = 0;
+        let probed =
+            unsafe { GetDIBits(dc, bitmap, 0, 0, ptr::null_mut(), &mut info, DIB_RGB_COLORS) };
+        let (width, height) = (info.bmiHeader.biWidth, info.bmiHeader.biHeight.abs());
+        if probed == 0 || width <= 0 || width != height {
+            return None;
+        }
+        let mut info = bitmap_info(width);
+        let mut pixels = vec![0u32; (width * height) as usize];
+        let read = unsafe {
+            GetDIBits(
+                dc,
+                bitmap,
+                0,
+                height as u32,
+                pixels.as_mut_ptr() as *mut c_void,
+                &mut info,
+                DIB_RGB_COLORS,
+            )
+        };
+        if read == 0 {
+            return None;
+        }
+        Image::from_pixels(width as usize, pixels)
+    }
+
+    /// The colour pixels of an icon handle.
+    fn icon_pixels(icon: HICON) -> Option<Image> {
+        let mut info: ICONINFO = unsafe { mem::zeroed() };
+        if unsafe { GetIconInfo(icon, &mut info) } == 0 {
+            return None;
+        }
+        let dc = unsafe { GetDC(ptr::null_mut()) };
+        let image = bitmap_pixels(dc, info.hbmColor);
+        unsafe {
+            ReleaseDC(ptr::null_mut(), dc);
+            DeleteObject(info.hbmColor);
+            DeleteObject(info.hbmMask);
+        }
+        image
+    }
 
     #[test]
     fn structure_layouts() {
@@ -352,45 +301,23 @@ mod tests {
     }
 
     #[test]
-    fn an_icon_round_trips_through_a_handle() {
-        let image = icon::boxed(16, None);
+    fn an_icon_round_trips_through_a_handle_with_its_alpha() {
+        let mut image = Image::blank(32);
+        image.pixels[0] = icon::opaque(10, 20, 30);
+        image.pixels[33] = 0x8040_2010;
+        image.pixels[1023] = icon::opaque(255, 255, 255);
         let icon = create_icon(&image).unwrap();
         let back = icon_pixels(icon.handle()).unwrap();
-        assert_eq!(back.size, 16);
+        assert_eq!(back.size, 32);
         assert_eq!(back.pixels, image.pixels);
     }
 
     #[test]
-    fn a_label_survives_the_round_trip_with_its_alpha() {
-        let mut label = Image::blank(32);
-        label.pixels[0] = icon::opaque(10, 20, 30);
-        label.pixels[33] = 0x8040_2010;
-        let image = icon::boxed(32, Some(&label));
-        let icon = create_icon(&image).unwrap();
+    fn the_app_icon_is_the_artwork_at_the_system_size() {
+        let icon = app_icon().unwrap();
         let back = icon_pixels(icon.handle()).unwrap();
-        assert_eq!(back.pixels, image.pixels);
-    }
-
-    #[test]
-    fn the_boxed_icon_is_built_with_or_without_a_program() {
-        let plain = boxed_program_icon(None).unwrap();
-        assert_eq!(icon_pixels(plain.handle()).unwrap().size, small_icon_size());
-        let labelled = boxed_program_icon(kanali_path().as_deref()).unwrap();
-        assert!(!labelled.handle().is_null());
-    }
-
-    #[test]
-    fn the_installed_program_icon_comes_in_two_sizes() {
-        if let Some(path) = kanali_path() {
-            let small = program_icon(&path, 10).expect("the installed program has an icon");
-            assert!(small.size >= 10);
-            assert!(small.has_alpha());
-            let large = program_icon(&path, small.size + 1).unwrap();
-            assert!(large.size > small.size);
-            let largest = program_icon(&path, 4096).unwrap();
-            assert_eq!(largest.size, large.size);
-        }
-        assert_eq!(program_icon(Path::new(r"C:\ezrama-no-such-program.exe"), 16), None);
+        assert_eq!(back.size, small_icon_size());
+        assert_eq!(back.pixels, Image::embedded().resample(small_icon_size()).pixels);
     }
 
     #[test]
