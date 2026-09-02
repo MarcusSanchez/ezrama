@@ -250,12 +250,14 @@ impl TrayIcon {
     }
 
     /// Shows the entry, or shows it again after the taskbar was recreated.
+    /// An add the shell reports as failed may still have taken effect, so
+    /// a failed add is followed by a modify that claims the entry if so.
     pub fn show(&mut self) -> bool {
         if self.shown {
             self.notify(NIM_DELETE);
             self.shown = false;
         }
-        if !self.notify(NIM_ADD) {
+        if !self.notify(NIM_ADD) && !self.notify(NIM_MODIFY) {
             return false;
         }
         self.shown = true;
