@@ -22,6 +22,14 @@ impl Logger {
         }
     }
 
+    /// Discards every line.
+    pub fn silent() -> Self {
+        Self {
+            file: None,
+            echo: false,
+        }
+    }
+
     /// Logs to `path`, creating its directory, rotating a large existing
     /// file to `.old`, and echoing to standard output when `echo` is set.
     /// If the file cannot be opened, lines still go to standard output.

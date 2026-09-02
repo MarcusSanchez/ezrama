@@ -5,10 +5,13 @@ pub mod icon;
 pub mod log;
 pub mod pb;
 pub mod session;
+pub mod supervisor;
 pub mod transport;
 pub mod watch;
 pub mod wire;
 
+#[cfg(windows)]
+pub mod backend;
 #[cfg(windows)]
 pub mod install;
 #[cfg(windows)]

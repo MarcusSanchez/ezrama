@@ -164,19 +164,31 @@ impl Control {
 
 /// Grows the pause between session start attempts while the display stays
 /// present but the session keeps failing.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reconnect {
     attempt: u32,
+    unit: Duration,
+}
+
+impl Default for Reconnect {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Reconnect {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_unit(RECONNECT_INITIAL)
+    }
+
+    /// A schedule that starts at `unit` and is capped at ten times it.
+    pub fn with_unit(unit: Duration) -> Self {
+        Self { attempt: 0, unit }
     }
 
     /// The pause before the next attempt: 3, 6, 12, 24, then 30 s.
     pub fn next_delay(&mut self) -> Duration {
-        let delay = (RECONNECT_INITIAL * (1u32 << self.attempt.min(4))).min(RECONNECT_MAX);
+        let delay = (self.unit * (1u32 << self.attempt.min(4))).min(self.unit * 10);
         self.attempt = self.attempt.saturating_add(1);
         delay
     }
@@ -205,6 +217,10 @@ mod tests {
         reconnect.reset();
         assert_eq!(reconnect.attempts(), 0);
         assert_eq!(reconnect.next_delay(), RECONNECT_INITIAL);
+        assert_eq!(Reconnect::new().next_delay() * 10, RECONNECT_MAX);
+        let mut quick = Reconnect::with_unit(Duration::from_millis(1));
+        let delays: Vec<u64> = (0..6).map(|_| quick.next_delay().as_millis() as u64).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 10, 10]);
     }
 
     #[test]

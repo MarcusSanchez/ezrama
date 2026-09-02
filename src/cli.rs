@@ -148,12 +148,11 @@ fn show(value: &str) -> &str {
 
 #[cfg(windows)]
 mod win_cli {
-    use super::{show, EXIT_BUSY, EXIT_SEVERAL};
+    use super::{EXIT_BUSY, EXIT_SEVERAL};
     use crate::overlapped::UsbprintTransport;
-    use crate::session::{KeepaliveOutcome, OptionalReply, Session};
+    use crate::session::Session;
     use crate::usbprint::{self, Device, Discovery, OpenError};
     use std::process::ExitCode;
-    use std::time::Instant;
 
     /// Finds the one display, printing why when that is not possible.
     pub fn locate() -> Result<String, ExitCode> {
@@ -195,50 +194,12 @@ mod win_cli {
         }
     }
 
-    /// Runs the session start on an open device: bootstrap, the activation
-    /// trigger, and the first Ping. Each step is reported through `report`.
-    pub fn establish(
-        device: Device,
-        report: &mut dyn FnMut(&str),
-    ) -> Result<Session<UsbprintTransport>, String> {
-        let mut session = Session::new(UsbprintTransport::new(device));
-        let started = Instant::now();
-        let bootstrap = session
-            .bootstrap()
-            .map_err(|error| format!("session start failed: {error}"))?;
-        report(&format!(
-            "session started in {} ms: {} firmware {}",
-            started.elapsed().as_millis(),
-            show(&bootstrap.device.product_name),
-            show(&bootstrap.device.firmware_version)
-        ));
-
-        match session.activate() {
-            Ok(OptionalReply::Acknowledged) => report("activation trigger acknowledged"),
-            Ok(OptionalReply::None) => report("activation trigger sent; no reply within the window"),
-            Ok(OptionalReply::Drained) => {
-                report("activation trigger sent; an unrelated frame was consumed")
-            }
-            Err(error) => return Err(format!("activation failed: {error}")),
-        }
-
-        match session.ping() {
-            KeepaliveOutcome::Sent(OptionalReply::None) => {
-                report("ping sent; no reply within the window")
-            }
-            KeepaliveOutcome::Sent(_) => report("ping sent; a reply was consumed"),
-            KeepaliveOutcome::Retryable(error) => report(&format!("ping did not transfer: {error}")),
-            KeepaliveOutcome::Fatal(error) => return Err(format!("ping failed: {error}")),
-        }
-        Ok(session)
-    }
-
     /// Locates and opens the display, then runs the session start, printing
     /// each step.
     pub fn start_session() -> Result<Session<UsbprintTransport>, ExitCode> {
         let path = locate()?;
         let device = open(&path)?;
-        establish(device, &mut |line| println!("{line}")).map_err(|message| {
+        crate::backend::establish(device, &mut |line| println!("{line}")).map_err(|message| {
             eprintln!("{message}");
             ExitCode::from(1)
         })
@@ -477,39 +438,10 @@ fn activate() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Console control events turn into a stop request for the holding loop
-/// and the watcher.
-#[cfg(windows)]
-mod stop_signal {
-    use crate::win::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    static STOP: AtomicBool = AtomicBool::new(false);
-
-    unsafe extern "system" fn handler(ctrl_type: DWORD) -> BOOL {
-        match ctrl_type {
-            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT => {
-                STOP.store(true, Ordering::SeqCst);
-                crate::window::interrupt();
-                crate::window::request_stop();
-                1
-            }
-            _ => 0,
-        }
-    }
-
-    pub fn install() -> bool {
-        unsafe { SetConsoleCtrlHandler(Some(handler), 1) != 0 }
-    }
-
-    pub fn requested() -> bool {
-        STOP.load(Ordering::SeqCst)
-    }
-}
-
 /// Starts a session and holds it with periodic Pings until Ctrl+C or loss.
 #[cfg(windows)]
 fn run(verbose: bool, interval: Duration) -> ExitCode {
+    use crate::backend::stop_signal;
     use crate::hold::{hold, HoldEvent, KEEPALIVE_WRITE_RETRIES};
     use crate::session::OptionalReply;
 
@@ -562,21 +494,19 @@ fn run(verbose: bool, interval: Duration) -> ExitCode {
     }
 }
 
-/// Keeps a session whenever the display is present. Reacts to the display
-/// arriving and leaving, retries a failed session start with growing
-/// pauses, shows a notification-area icon with a menu, and writes a log
-/// file.
+/// Keeps a session whenever the display is present, with a
+/// notification-area icon and a log file. The policy lives in
+/// [`crate::supervisor`]; this sets the machine up and tears it down.
 #[cfg(windows)]
 fn watch(verbose: bool, interval: Duration) -> ExitCode {
-    use crate::hold::{hold, HoldEvent, KEEPALIVE_WRITE_RETRIES};
+    use crate::backend::{stop_signal, WindowsBackend};
     use crate::launcher;
     use crate::log::{default_log_path, Logger};
+    use crate::supervisor::Supervisor;
     use crate::tray;
-    use crate::usbprint::{self, Device, Discovery};
-    use crate::watch::{Control, Directive, Event, Reconnect, State};
-    use crate::window::{self, Setup};
-    use std::path::Path;
-    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+    use crate::watch::Event;
+    use crate::window::{self, PausedSignal, Setup};
+    use std::sync::mpsc;
     use std::thread;
 
     let mut log = match default_log_path() {
@@ -590,7 +520,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
     if !stop_signal::install() {
         log.log("console stop handler unavailable");
     }
-    let paused_signal = match window::PausedSignal::create() {
+    let paused_signal = match PausedSignal::create() {
         Ok(signal) => Some(signal),
         Err(error) => {
             log.log(&format!("pause confirmation unavailable: {error}"));
@@ -619,205 +549,9 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
     let (sender, events) = mpsc::channel::<Event>();
     let pump = thread::spawn(move || window::run_message_loop(sender, setup));
 
-    /// Applies one event to the control state and logs it.
-    fn apply(event: Event, control: &mut Control, log: &mut Logger) -> Directive {
-        match &event {
-            Event::Arrived(path) => log.log(&format!("panel arrived: {path}")),
-            Event::Removed(path) => log.log(&format!("panel removed: {path}")),
-            Event::Pause => log.log("pause requested"),
-            Event::Resume => log.log("resume requested"),
-            Event::OpenKanali => log.log("KANALI requested"),
-            Event::KanaliClosed => log.log("KANALI has exited"),
-            Event::Quit => log.log("stop requested"),
-        }
-        control.apply(&event)
-    }
+    let backend = WindowsBackend::new(paused_signal, kanali);
+    let (_, mut log) = Supervisor::new(backend, log, interval, verbose).run(&events);
 
-    /// Handles queued events without waiting.
-    fn drain(events: &Receiver<Event>, control: &mut Control, log: &mut Logger) -> Directive {
-        while let Ok(event) = events.try_recv() {
-            if apply(event, control, log) == Directive::Quit {
-                return Directive::Quit;
-            }
-        }
-        Directive::Continue
-    }
-
-    /// Waits for one event, or for `timeout` when given. A vanished
-    /// notification loop counts as a quit.
-    fn wait(
-        events: &Receiver<Event>,
-        timeout: Option<Duration>,
-        control: &mut Control,
-        log: &mut Logger,
-    ) -> Directive {
-        let event = match timeout {
-            None => match events.recv() {
-                Ok(event) => event,
-                Err(_) => return Directive::Quit,
-            },
-            Some(timeout) => match events.recv_timeout(timeout) {
-                Ok(event) => event,
-                Err(RecvTimeoutError::Timeout) => return Directive::Continue,
-                Err(RecvTimeoutError::Disconnected) => return Directive::Quit,
-            },
-        };
-        apply(event, control, log)
-    }
-
-    /// Starts KANALI and, on its own thread, waits for every KANALI
-    /// process to exit before reporting back.
-    fn launch_kanali(path: &Path, log: &mut Logger) -> bool {
-        match launcher::launch(path) {
-            Ok(process) => {
-                log.log(&format!("started KANALI (process {})", process.id()));
-                thread::spawn(move || {
-                    process.wait();
-                    launcher::wait_for_processes_named(launcher::KANALI_EXE);
-                    window::post_event(Event::KanaliClosed);
-                });
-                true
-            }
-            Err(error) => {
-                log.log(&format!("could not start KANALI: {error}"));
-                false
-            }
-        }
-    }
-
-    let mut reconnect = Reconnect::new();
-    let mut control = Control::new();
-    let mut announced: Option<State> = None;
-    loop {
-        if stop_signal::requested() || drain(&events, &mut control, &mut log) == Directive::Quit {
-            break;
-        }
-        window::clear_interrupt();
-
-        if control.paused() {
-            if let Some(signal) = &paused_signal {
-                signal.set();
-            }
-            if control.take_launch() {
-                let started = match &kanali {
-                    Some(path) => launch_kanali(path, &mut log),
-                    None => {
-                        log.log("KANALI is not installed");
-                        false
-                    }
-                };
-                if !started {
-                    control.apply(&Event::KanaliClosed);
-                    continue;
-                }
-            }
-            let state = control.paused_state();
-            window::set_state(state);
-            if announced != Some(state) {
-                log.log(match state {
-                    State::WaitingForKanali => "paused until KANALI exits",
-                    _ => "paused: the panel is released until resume",
-                });
-                announced = Some(state);
-            }
-            if wait(&events, None, &mut control, &mut log) == Directive::Quit {
-                break;
-            }
-            continue;
-        }
-        if let Some(signal) = &paused_signal {
-            signal.clear();
-        }
-        announced = None;
-
-        let path = match usbprint::find_panorama() {
-            Ok(Discovery::One(path)) => path,
-            Ok(Discovery::Absent) => {
-                window::set_state(State::NoDisplay);
-                log.log("panel not present; waiting");
-                if wait(&events, None, &mut control, &mut log) == Directive::Quit {
-                    break;
-                }
-                continue;
-            }
-            Ok(Discovery::Several(paths)) => {
-                window::set_state(State::NoDisplay);
-                log.log(&format!("{} panels present; waiting for exactly one", paths.len()));
-                if wait(&events, None, &mut control, &mut log) == Directive::Quit {
-                    break;
-                }
-                continue;
-            }
-            Err(error) => {
-                window::set_state(State::Connecting);
-                log.log(&format!("discovery failed: {error}"));
-                if wait(&events, Some(reconnect.next_delay()), &mut control, &mut log)
-                    == Directive::Quit
-                {
-                    break;
-                }
-                continue;
-            }
-        };
-
-        window::set_state(State::Connecting);
-        let started = Device::open(&path)
-            .map_err(|error| error.to_string())
-            .and_then(|device| win_cli::establish(device, &mut |line| log.log(line)));
-        let mut session = match started {
-            Ok(session) => session,
-            Err(message) => {
-                let delay = reconnect.next_delay();
-                log.log(&format!("{message}; retrying in {} s", delay.as_secs()));
-                if wait(&events, Some(delay), &mut control, &mut log) == Directive::Quit {
-                    break;
-                }
-                continue;
-            }
-        };
-        reconnect.reset();
-        window::set_state(State::Active);
-        log.log(&format!("holding: ping every {} ms", interval.as_millis()));
-
-        let last_outbound = session.now();
-        let mut pings = 0u64;
-        let result = hold(
-            &mut session,
-            interval,
-            last_outbound,
-            &|| window::interrupted() || stop_signal::requested(),
-            &mut |event| match event {
-                HoldEvent::Pinged(_, drained) => {
-                    pings += 1;
-                    if verbose {
-                        log.log(&format!("ping {pings}; {drained} unasked frames drained so far"));
-                    }
-                }
-                HoldEvent::Retrying { attempt, error } => {
-                    log.log(&format!("ping retry {attempt} of {KEEPALIVE_WRITE_RETRIES}: {error}"));
-                }
-                HoldEvent::Stopped => {}
-            },
-        );
-        drop(session);
-        match result {
-            Ok(()) => log.log(&format!("session released after {pings} pings")),
-            Err(error) => {
-                window::set_state(State::Connecting);
-                let delay = reconnect.next_delay();
-                log.log(&format!(
-                    "session lost after {pings} pings: {error}; retrying in {} s",
-                    delay.as_secs()
-                ));
-                if wait(&events, Some(delay), &mut control, &mut log) == Directive::Quit {
-                    break;
-                }
-            }
-        }
-    }
-
-    window::set_state(State::Quitting);
-    log.log("watch stopping");
     window::request_stop();
     match pump.join() {
         Ok(Ok(())) => {}
