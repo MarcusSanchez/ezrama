@@ -5,14 +5,17 @@
 //! call returns [`SessionError::Closed`] and a new session must be started
 //! on a fresh transport.
 
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::BuildHasher;
+use std::num::NonZeroU64;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::frame::{self, Decoder, FrameError};
 use crate::pb::DecodeError;
 use crate::transport::{ReadError, Transport, WriteError};
-use crate::wire::{self, field, DeviceInformation, ProtocolError, Response};
+use crate::wire::{self, field, DeviceInformation, ProtocolError, Response, UserConfiguration};
 
 /// Unrelated complete frames tolerated while waiting for a match.
 pub const MAX_SKIPPED_FRAMES: usize = 256;
@@ -31,6 +34,10 @@ pub const READINESS_DEADLINE: Duration = Duration::from_millis(20_000);
 pub const READINESS_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 /// Longest pause between DeviceInfo attempts.
 pub const READINESS_MAX_BACKOFF: Duration = Duration::from_millis(2000);
+/// Attempts allowed for a read-only query whose reply times out cleanly.
+pub const IDEMPOTENT_QUERY_ATTEMPTS: u32 = 2;
+/// Pause before the second attempt of a read-only query.
+pub const IDEMPOTENT_QUERY_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Time source for deadlines and backoff, replaceable in tests.
 pub trait Clock {
@@ -68,6 +75,8 @@ pub enum SessionError {
     TooManySkipped,
     /// No matching response arrived before the deadline.
     Timeout,
+    /// The deadline passed with part of a frame received.
+    IncompleteResponse,
     /// A response carried a header the exchange does not accept.
     UnexpectedHeader,
     /// The device answered with an error.
@@ -91,6 +100,9 @@ impl fmt::Display for SessionError {
                 write!(f, "too many unrelated response frames")
             }
             SessionError::Timeout => write!(f, "timed out waiting for the matching response"),
+            SessionError::IncompleteResponse => {
+                write!(f, "the response was cut off before the deadline")
+            }
             SessionError::UnexpectedHeader => write!(f, "response has an unexpected header"),
             SessionError::Rejected(error) => {
                 if error.why.is_empty() {
@@ -144,6 +156,13 @@ pub struct Session<T: Transport> {
     decoder: Decoder,
     closed: Option<SessionError>,
     clock: Box<dyn Clock + Send>,
+    next_track: u64,
+}
+
+/// A random starting point for track ids, so a new session's ids do not
+/// collide with responses left over from an earlier one.
+fn random_track_seed() -> u64 {
+    RandomState::new().hash_one(0u8)
 }
 
 impl<T: Transport> Session<T> {
@@ -157,7 +176,27 @@ impl<T: Transport> Session<T> {
             decoder: Decoder::new(),
             closed: None,
             clock,
+            next_track: random_track_seed(),
         }
+    }
+
+    /// Sets where track ids continue from, for reproducible sessions.
+    pub fn seed_track_ids(&mut self, seed: u64) {
+        self.next_track = seed;
+    }
+
+    /// The next track id, never zero.
+    pub fn allocate_track(&mut self) -> NonZeroU64 {
+        let mut id = self.next_track;
+        self.next_track = self.next_track.wrapping_add(1);
+        if id == 0 {
+            id = self.next_track;
+            self.next_track = self.next_track.wrapping_add(1);
+        }
+        if self.next_track == 0 {
+            self.next_track = 1;
+        }
+        NonZeroU64::new(id).unwrap_or(NonZeroU64::MIN)
     }
 
     /// Whether the session can still be used.
@@ -257,6 +296,103 @@ impl<T: Transport> Session<T> {
         }
         self.decoder.clear();
         Ok(drained)
+    }
+
+    /// One tracked exchange: drain, write the request built for a fresh
+    /// track id, and wait for the response carrying that id and
+    /// `expected_body`.
+    ///
+    /// Frames for other track ids, header-less Pong frames, and events are
+    /// skipped within the budget. A response without a header, a wrong
+    /// body, a malformed frame, or a write failure closes the session. A
+    /// device error is returned without closing. A clean timeout closes the
+    /// session unless `keep_open_on_timeout` is set; a timeout with part of
+    /// a frame received always closes.
+    pub fn execute(
+        &mut self,
+        request: impl FnOnce(NonZeroU64) -> Vec<u8>,
+        expected_body: u32,
+        keep_open_on_timeout: bool,
+    ) -> Result<Vec<u8>, SessionError> {
+        self.ensure_open()?;
+        let track = self.allocate_track();
+        let frame = framed(&request(track))?;
+        self.drain(DRAIN_WINDOW)?;
+        if let Err(error) = self.write_bytes(&frame, TRANSACTION_TIMEOUT) {
+            return Err(self.close(error));
+        }
+
+        let deadline = self.clock.now() + TRANSACTION_TIMEOUT;
+        let mut discarded = 0;
+        let mut budget = SkipBudget::default();
+        loop {
+            let Some(payload) = self.read_frame(deadline, &mut discarded)? else {
+                if self.decoder.buffered() > 0 {
+                    return Err(self.close(SessionError::IncompleteResponse));
+                }
+                if keep_open_on_timeout {
+                    return Err(SessionError::Timeout);
+                }
+                return Err(self.close(SessionError::Timeout));
+            };
+            let response = match Response::parse(&payload) {
+                Ok(response) => response,
+                Err(error) => return Err(self.close(SessionError::Decode(error))),
+            };
+            let body_number = response.body_number();
+            let unsolicited = body_number == Some(field::ASYNCHRONOUS_EVENT)
+                || (body_number == Some(field::PONG) && expected_body != field::PONG);
+            if unsolicited {
+                if !budget.skip(payload.len()) {
+                    return Err(self.close(SessionError::TooManySkipped));
+                }
+                continue;
+            }
+            let Some(header) = response.header else {
+                return Err(self.close(SessionError::UnexpectedHeader));
+            };
+            if header.track_id != track.get() {
+                if !budget.skip(payload.len()) {
+                    return Err(self.close(SessionError::TooManySkipped));
+                }
+                continue;
+            }
+            if let Some(rejection) = response.rejection() {
+                return Err(SessionError::Rejected(rejection.clone()));
+            }
+            return match response.body {
+                Some((number, body)) if number == expected_body => Ok(body.to_vec()),
+                other => Err(self.close(SessionError::UnexpectedBody {
+                    expected: expected_body,
+                    actual: other.map(|(number, _)| number),
+                })),
+            };
+        }
+    }
+
+    /// Reads the device's user configuration. The query is idempotent, so a
+    /// clean timeout on the first attempt is followed by one more after a
+    /// short pause.
+    pub fn query_user_configuration(&mut self) -> Result<UserConfiguration, SessionError> {
+        let mut attempt = 1;
+        loop {
+            let retry_available = attempt < IDEMPOTENT_QUERY_ATTEMPTS;
+            match self.execute(
+                wire::user_configuration_query,
+                field::USER_CONFIGURATION,
+                retry_available,
+            ) {
+                Ok(body) => {
+                    return UserConfiguration::parse(&body)
+                        .map_err(|error| self.close(SessionError::Decode(error)));
+                }
+                Err(SessionError::Timeout) if retry_available => {
+                    self.clock.sleep(IDEMPOTENT_QUERY_BACKOFF);
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Runs the three untracked exchanges that open a display session:
@@ -998,5 +1134,246 @@ mod tests {
         let (mut session, _) = bootstrap_session(mock);
         assert_eq!(session.bootstrap(), Err(SessionError::TooManySkipped));
         assert!(!session.is_open());
+    }
+
+    fn tracked_header(track: u64) -> Message {
+        Message::new().uint(1, 1).uint(2, track)
+    }
+
+    fn config_body() -> Message {
+        let work = Message::new().uint(2, 1).bytes(3, b"wall.mp4");
+        let display = Message::new().uint(1, 1).uint(2, 75);
+        Message::new()
+            .message(1, &Message::new().bytes(1, b"boot.mp4"))
+            .message(2, &Message::new().uint(1, 1).bytes(2, b"idle.mp4"))
+            .message(3, &work)
+            .message(5, &display)
+    }
+
+    fn config_response(track: u64) -> Vec<u8> {
+        response(
+            Some(tracked_header(track)),
+            None,
+            Some((field::USER_CONFIGURATION, config_body())),
+        )
+    }
+
+    fn tracked_session(mock: MockTransport, seed: u64) -> (Session<MockTransport>, FakeClock) {
+        let (mut session, clock) = bootstrap_session(mock);
+        session.seed_track_ids(seed);
+        (session, clock)
+    }
+
+    #[test]
+    fn track_ids_increment_and_skip_zero() {
+        let (mut session, _) = tracked_session(MockTransport::new(), u64::MAX - 1);
+        assert_eq!(session.allocate_track().get(), u64::MAX - 1);
+        assert_eq!(session.allocate_track().get(), u64::MAX);
+        assert_eq!(session.allocate_track().get(), 1);
+        assert_eq!(session.allocate_track().get(), 2);
+        session.seed_track_ids(0);
+        assert_eq!(session.allocate_track().get(), 1);
+    }
+
+    #[test]
+    fn track_ids_start_from_a_random_non_zero_seed() {
+        let first = Session::new(MockTransport::new()).allocate_track().get();
+        let second = Session::new(MockTransport::new()).allocate_track().get();
+        assert_ne!(first, 0);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn query_returns_the_configuration_and_writes_the_tracked_request() {
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(config_response(41));
+        let (mut session, clock) = tracked_session(mock, 41);
+
+        let config = session.query_user_configuration().unwrap();
+        assert_eq!(config.work.as_ref().unwrap().single_mode_media_file, "wall.mp4");
+        assert_eq!(config.display.as_ref().unwrap().backlight_brightness, 75);
+        assert_eq!(config.standby.as_ref().unwrap().media_file, "idle.mp4");
+        assert!(session.is_open());
+        assert_eq!(clock.sleeps_ms(), Vec::<u64>::new());
+        let mock = session.into_transport();
+        assert_eq!(
+            mock.writes,
+            vec![encode(&wire::user_configuration_query(NonZeroU64::new(41).unwrap())).unwrap()]
+        );
+    }
+
+    #[test]
+    fn execute_drains_stale_frames_before_writing() {
+        let stale = config_response(40);
+        let mut mock = MockTransport::new();
+        mock.queue_read(stale).queue_after_write(config_response(41));
+        let (mut session, _) = tracked_session(mock, 41);
+        assert!(session.query_user_configuration().is_ok());
+    }
+
+    #[test]
+    fn execute_skips_other_tracks_pongs_and_events() {
+        let other_track = config_response(99);
+        let pong = response(None, None, Some((field::PONG, Message::new().bytes(1, b"hello?"))));
+        let event = response(
+            Some(tracked_header(41)),
+            None,
+            Some((field::ASYNCHRONOUS_EVENT, Message::new().uint(1, 1))),
+        );
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(other_track)
+            .queue_read(pong)
+            .queue_read(event)
+            .queue_read(config_response(41));
+        let (mut session, _) = tracked_session(mock, 41);
+        assert!(session.query_user_configuration().is_ok());
+        assert!(session.is_open());
+    }
+
+    #[test]
+    fn execute_rejects_a_headerless_response() {
+        let missing = response(None, None, Some((field::USER_CONFIGURATION, config_body())));
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(missing);
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(session.query_user_configuration(), Err(SessionError::UnexpectedHeader));
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn execute_returns_a_device_error_without_closing() {
+        let rejected = response(
+            Some(tracked_header(41)),
+            Some(Message::new().uint(1, 2).bytes(2, b"unsupported")),
+            None,
+        );
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(rejected);
+        let (mut session, clock) = tracked_session(mock, 41);
+        assert_eq!(
+            session.query_user_configuration(),
+            Err(SessionError::Rejected(ProtocolError {
+                code: 2,
+                why: "unsupported".into()
+            }))
+        );
+        assert!(session.is_open());
+        assert_eq!(clock.sleeps_ms(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn execute_closes_on_the_wrong_body() {
+        let wrong = response(
+            Some(tracked_header(41)),
+            None,
+            Some((field::ACKNOWLEDGEMENT, Message::new())),
+        );
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(wrong);
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(
+            session.query_user_configuration(),
+            Err(SessionError::UnexpectedBody {
+                expected: field::USER_CONFIGURATION,
+                actual: Some(field::ACKNOWLEDGEMENT)
+            })
+        );
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn execute_closes_on_a_malformed_response() {
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(encode(&[0x0a, 0x09, 0x08]).unwrap());
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(
+            session.query_user_configuration(),
+            Err(SessionError::Decode(DecodeError::Truncated))
+        );
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn query_retries_once_after_a_clean_timeout() {
+        let mut mock = MockTransport::new();
+        mock.queue_wait_for_write().queue_after_write(config_response(42));
+        let (mut session, clock) = tracked_session(mock, 41);
+
+        assert!(session.query_user_configuration().is_ok());
+        assert!(session.is_open());
+        assert_eq!(clock.sleeps_ms(), [250]);
+        let mock = session.into_transport();
+        assert_eq!(mock.writes.len(), 2);
+        assert_eq!(
+            mock.writes[0],
+            encode(&wire::user_configuration_query(NonZeroU64::new(41).unwrap())).unwrap()
+        );
+        assert_eq!(
+            mock.writes[1],
+            encode(&wire::user_configuration_query(NonZeroU64::new(42).unwrap())).unwrap()
+        );
+    }
+
+    #[test]
+    fn query_gives_up_after_the_second_clean_timeout() {
+        let mut mock = MockTransport::new();
+        mock.queue_wait_for_write().queue_wait_for_write();
+        let (mut session, clock) = tracked_session(mock, 41);
+        assert_eq!(session.query_user_configuration(), Err(SessionError::Timeout));
+        assert!(!session.is_open());
+        assert_eq!(clock.sleeps_ms(), [250]);
+        assert_eq!(session.into_transport().writes.len(), 2);
+    }
+
+    #[test]
+    fn a_partial_frame_at_the_deadline_is_not_retried() {
+        let partial = config_response(41)[..5].to_vec();
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(partial);
+        let (mut session, clock) = tracked_session(mock, 41);
+        assert_eq!(
+            session.query_user_configuration(),
+            Err(SessionError::IncompleteResponse)
+        );
+        assert!(!session.is_open());
+        assert_eq!(clock.sleeps_ms(), Vec::<u64>::new());
+        assert_eq!(session.into_transport().writes.len(), 1);
+    }
+
+    #[test]
+    fn a_tracked_write_failure_closes_without_retry() {
+        let mut mock = MockTransport::new();
+        mock.queue_write_result(Err(WriteError::TimedOut));
+        let (mut session, clock) = tracked_session(mock, 41);
+        assert_eq!(
+            session.query_user_configuration(),
+            Err(SessionError::Write(WriteError::TimedOut))
+        );
+        assert!(!session.is_open());
+        assert_eq!(clock.sleeps_ms(), Vec::<u64>::new());
+        assert_eq!(session.into_transport().writes.len(), 1);
+    }
+
+    #[test]
+    fn execute_stops_after_too_many_unrelated_tracks() {
+        let unrelated = config_response(7);
+        let mut bytes = Vec::new();
+        for _ in 0..=MAX_SKIPPED_FRAMES {
+            bytes.extend(&unrelated);
+        }
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(bytes);
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(session.query_user_configuration(), Err(SessionError::TooManySkipped));
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn execute_on_a_closed_session_is_refused() {
+        let mut mock = MockTransport::new();
+        mock.queue_write_result(Err(WriteError::Unknown));
+        let (mut session, _) = tracked_session(mock, 41);
+        assert!(session.query_user_configuration().is_err());
+        assert_eq!(session.query_user_configuration(), Err(SessionError::Closed));
     }
 }
