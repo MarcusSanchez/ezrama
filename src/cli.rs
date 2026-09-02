@@ -1000,7 +1000,7 @@ fn install() -> ExitCode {
                     entry.name, entry.command
                 );
             }
-            println!("      disable it in Task Manager under Startup apps, or the two will race for the panel at logon");
+            println!("      turn off start with Windows in KANALI's settings, or the two will race for the panel at logon");
         }
         Ok(_) => {}
         Err(error) => println!("could not check for KANALI startup entries: {error}"),
