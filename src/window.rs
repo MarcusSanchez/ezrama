@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::overlapped::wait_millis;
-use crate::tray::{Icon, Menu, TrayIcon};
+use crate::tray::{self, Icon, MenuChoice, TrayIcon};
 use crate::usbprint::{is_panorama_path, wide, WinError};
 use crate::watch::{Event, State};
 use crate::win::*;
@@ -39,11 +39,6 @@ const WM_OPEN_KANALI: u32 = WM_APP + 4;
 const WM_QUERY_STATE: u32 = WM_APP + 5;
 const WM_STATE_CHANGED: u32 = WM_APP + 6;
 const WM_TRAY: u32 = WM_APP + 7;
-
-const MENU_PAUSE: usize = 1;
-const MENU_RESUME: usize = 2;
-const MENU_OPEN_KANALI: usize = 3;
-const MENU_QUIT: usize = 4;
 
 static SENDER: Mutex<Option<Sender<Event>>> = Mutex::new(None);
 static INTERRUPT: AtomicBool = AtomicBool::new(false);
@@ -313,34 +308,15 @@ unsafe fn broadcast_path(lparam: LPARAM) -> Option<String> {
     Some(String::from_utf16_lossy(&units))
 }
 
-/// Builds the menu for the current state, shows it, and acts on the
-/// choice.
+/// Shows the menu for the current state and acts on the choice.
 fn show_menu(window: HWND) {
-    let Ok(menu) = Menu::new() else {
-        return;
-    };
-    let state = state();
-    menu.item(0, state.label(), false);
-    menu.separator();
-    if state.released() {
-        menu.item(MENU_RESUME, "Resume", true);
-    } else {
-        menu.item(MENU_PAUSE, "Pause", true);
-    }
     let kanali = KANALI_AVAILABLE.load(Ordering::SeqCst);
-    menu.item(
-        MENU_OPEN_KANALI,
-        if kanali { "Open KANALI" } else { "KANALI is not installed" },
-        kanali && state != State::WaitingForKanali,
-    );
-    menu.separator();
-    menu.item(MENU_QUIT, "Quit", true);
-    match menu.show(window) {
-        Some(MENU_PAUSE) => post_event(Event::Pause),
-        Some(MENU_RESUME) => post_event(Event::Resume),
-        Some(MENU_OPEN_KANALI) => post_event(Event::OpenKanali),
-        Some(MENU_QUIT) => quit(),
-        _ => {}
+    match tray::show_menu(window, state(), kanali) {
+        Some(MenuChoice::Pause) => post_event(Event::Pause),
+        Some(MenuChoice::Resume) => post_event(Event::Resume),
+        Some(MenuChoice::OpenKanali) => post_event(Event::OpenKanali),
+        Some(MenuChoice::Quit) => quit(),
+        None => {}
     }
     if STOPPING.load(Ordering::SeqCst) {
         quit();

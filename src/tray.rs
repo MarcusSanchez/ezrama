@@ -7,6 +7,7 @@ use std::ptr;
 
 use crate::icon::Image;
 use crate::usbprint::{wide, WinError};
+use crate::watch::State;
 use crate::win::*;
 
 /// An icon handle that is destroyed when dropped.
@@ -243,10 +244,115 @@ impl Drop for Menu {
     }
 }
 
+/// Something the menu offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuChoice {
+    Pause,
+    Resume,
+    OpenKanali,
+    Quit,
+}
+
+/// One line of the menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuEntry {
+    /// A disabled line that only shows text.
+    Label(String),
+    Separator,
+    Item {
+        choice: MenuChoice,
+        text: &'static str,
+        enabled: bool,
+    },
+}
+
+/// The menu for a watcher in `state`; `kanali` says whether KANALI is
+/// installed and can be started.
+pub fn menu_entries(state: State, kanali: bool) -> Vec<MenuEntry> {
+    let toggle = if state.released() {
+        MenuEntry::Item {
+            choice: MenuChoice::Resume,
+            text: "Resume",
+            enabled: true,
+        }
+    } else {
+        MenuEntry::Item {
+            choice: MenuChoice::Pause,
+            text: "Pause",
+            enabled: true,
+        }
+    };
+    vec![
+        MenuEntry::Label(state.label().to_string()),
+        MenuEntry::Separator,
+        toggle,
+        MenuEntry::Item {
+            choice: MenuChoice::OpenKanali,
+            text: if kanali { "Open KANALI" } else { "KANALI is not installed" },
+            enabled: kanali && state != State::WaitingForKanali,
+        },
+        MenuEntry::Separator,
+        MenuEntry::Item {
+            choice: MenuChoice::Quit,
+            text: "Quit",
+            enabled: true,
+        },
+    ]
+}
+
+/// Shows the menu for `state` at the cursor and returns what was chosen.
+pub fn show_menu(window: HWND, state: State, kanali: bool) -> Option<MenuChoice> {
+    let menu = Menu::new().ok()?;
+    let entries = menu_entries(state, kanali);
+    for (index, entry) in entries.iter().enumerate() {
+        match entry {
+            MenuEntry::Label(text) => menu.item(0, text, false),
+            MenuEntry::Separator => menu.separator(),
+            MenuEntry::Item { text, enabled, .. } => menu.item(index + 1, text, *enabled),
+        }
+    }
+    let chosen = menu.show(window)?;
+    match entries.get(chosen - 1) {
+        Some(MenuEntry::Item { choice, .. }) => Some(*choice),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::icon;
+
+    fn items(entries: &[MenuEntry]) -> Vec<(MenuChoice, &'static str, bool)> {
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MenuEntry::Item { choice, text, enabled } => Some((*choice, *text, *enabled)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_menu_follows_the_state() {
+        let active = menu_entries(State::Active, true);
+        assert_eq!(active[0], MenuEntry::Label("Active".to_string()));
+        assert_eq!(
+            items(&active),
+            [
+                (MenuChoice::Pause, "Pause", true),
+                (MenuChoice::OpenKanali, "Open KANALI", true),
+                (MenuChoice::Quit, "Quit", true)
+            ]
+        );
+        assert_eq!(items(&menu_entries(State::Paused, true))[0], (MenuChoice::Resume, "Resume", true));
+        let waiting = items(&menu_entries(State::WaitingForKanali, true));
+        assert_eq!(waiting[0].0, MenuChoice::Resume);
+        assert_eq!(waiting[1], (MenuChoice::OpenKanali, "Open KANALI", false));
+        let missing = items(&menu_entries(State::Connecting, false));
+        assert_eq!(missing[1], (MenuChoice::OpenKanali, "KANALI is not installed", false));
+        assert_eq!(menu_entries(State::NoDisplay, true).len(), 6);
+    }
 
     /// Reads a square bitmap back as pixels.
     fn bitmap_pixels(dc: HDC, bitmap: HBITMAP) -> Option<Image> {
