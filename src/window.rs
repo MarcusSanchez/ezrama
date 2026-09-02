@@ -130,7 +130,7 @@ pub fn set_state(state: State) {
 }
 
 fn tooltip(state: State) -> String {
-    format!("ezrama: {}", state.label())
+    format!("Ezrama: {}", state.label())
 }
 
 /// Finds the window of a watcher running anywhere in this desktop session.
@@ -636,8 +636,8 @@ mod tests {
 
     #[test]
     fn tooltips_carry_the_state_label() {
-        assert_eq!(tooltip(State::Active), "ezrama: Active");
-        assert_eq!(tooltip(State::WaitingForKanali), "ezrama: Waiting for KANALI");
+        assert_eq!(tooltip(State::Active), "Ezrama: Active");
+        assert_eq!(tooltip(State::WaitingForKanali), "Ezrama: Waiting for KANALI");
     }
 
     #[test]
