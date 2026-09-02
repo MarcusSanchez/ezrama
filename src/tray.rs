@@ -1,30 +1,15 @@
-//! The pieces of the notification-area icon that need Windows: an icon
-//! handle built from pixels, another program's icon read back as pixels,
-//! the pop-up menu, where KANALI is installed, and waiting for its
-//! processes to exit.
+//! The notification-area icon: an icon handle built from pixels, another
+//! program's icon read back as pixels, the entry itself, and its pop-up
+//! menu.
 
 use std::ffi::c_void;
 use std::mem;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
-use std::thread;
-use std::time::Duration;
 
-use crate::icon::Image;
-use crate::install::{read_string, start_detached, Process};
+use crate::icon::{boxed, layout, Image};
 use crate::usbprint::{wide, WinError};
 use crate::win::*;
-
-/// File name of KANALI's executable.
-pub const KANALI_EXE: &str = "KANALI.exe";
-/// Uninstall key written by KANALI's installer; its `DisplayIcon` value
-/// names the executable.
-pub const KANALI_UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\KANALI";
-/// After a started KANALI hands over to another process of its own, how
-/// long to look for that process before concluding KANALI has closed.
-pub const HANDOVER_GRACE: Duration = Duration::from_secs(1);
-/// How many times to look.
-pub const HANDOVER_CHECKS: u32 = 3;
 
 /// An icon handle that is destroyed when dropped.
 pub struct Icon {
@@ -212,6 +197,14 @@ pub fn program_icon(path: &Path, size: usize) -> Option<Image> {
     Some(candidates.swap_remove(chosen))
 }
 
+/// The icon for the notification area at the size it draws: the box, with
+/// the icon of the program at `program` on its front when there is one.
+pub fn boxed_program_icon(program: Option<&Path>) -> Result<Icon, WinError> {
+    let size = small_icon_size();
+    let label = program.and_then(|path| program_icon(path, layout(size).label));
+    create_icon(&boxed(size, label.as_ref()))
+}
+
 /// The notification-area entry for a window.
 pub struct TrayIcon {
     data: Box<NOTIFYICONDATAW>,
@@ -288,9 +281,12 @@ pub struct Menu {
 }
 
 impl Menu {
-    pub fn new() -> Option<Self> {
+    pub fn new() -> Result<Self, WinError> {
         let handle = unsafe { CreatePopupMenu() };
-        (!handle.is_null()).then_some(Self { handle })
+        if handle.is_null() {
+            return Err(WinError::last("CreatePopupMenu"));
+        }
+        Ok(Self { handle })
     }
 
     /// Appends an item that reports `id` when chosen.
@@ -342,127 +338,17 @@ impl Drop for Menu {
     }
 }
 
-/// A `DisplayIcon` value is a path, possibly quoted, possibly followed by
-/// a comma and an icon index.
-pub fn icon_source_path(value: &str) -> &str {
-    let value = value.trim();
-    let value = match value.strip_prefix('"') {
-        Some(rest) => rest.split('"').next().unwrap_or(""),
-        None => match value.rsplit_once(',') {
-            Some((path, index)) if index.trim().parse::<i32>().is_ok() => path,
-            _ => value,
-        },
-    };
-    value.trim()
-}
-
-/// Where KANALI's executable is, if it is installed.
-pub fn kanali_path() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
-        if let Ok(Some(value)) = read_string(root, KANALI_UNINSTALL_KEY, "DisplayIcon") {
-            candidates.push(PathBuf::from(icon_source_path(&value)));
-        }
-    }
-    if let Some(programs) = std::env::var_os("ProgramFiles") {
-        candidates.push(PathBuf::from(programs).join("KANALI").join(KANALI_EXE));
-    }
-    candidates.into_iter().find(|path| path.is_file())
-}
-
-/// Starts the program at `path` in its own directory.
-pub fn launch(path: &Path) -> Result<Process, WinError> {
-    start_detached(path, "", path.parent())
-}
-
-/// Process ids whose executable is named `name`, other than this process.
-pub fn processes_named(name: &str) -> Vec<u32> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Vec::new();
-    }
-    let own = unsafe { GetCurrentProcessId() };
-    let mut entry: PROCESSENTRY32W = unsafe { mem::zeroed() };
-    entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as DWORD;
-    let mut found = Vec::new();
-    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
-    while more {
-        let len = entry.szExeFile.iter().position(|&u| u == 0).unwrap_or(entry.szExeFile.len());
-        let exe = String::from_utf16_lossy(&entry.szExeFile[..len]);
-        if entry.th32ProcessID != own && exe.eq_ignore_ascii_case(name) {
-            found.push(entry.th32ProcessID);
-        }
-        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
-    }
-    unsafe {
-        CloseHandle(snapshot);
-    }
-    found
-}
-
-/// Waits for every listed process to exit. Processes that cannot be opened
-/// are ignored.
-fn wait_all(pids: &[u32]) {
-    let handles: Vec<HANDLE> = pids
-        .iter()
-        .take(64)
-        .map(|&pid| unsafe { OpenProcess(SYNCHRONIZE, 0, pid) })
-        .filter(|handle| !handle.is_null())
-        .collect();
-    if !handles.is_empty() {
-        unsafe {
-            WaitForMultipleObjects(handles.len() as DWORD, handles.as_ptr(), 1, INFINITE);
-        }
-    }
-    for handle in handles {
-        unsafe {
-            CloseHandle(handle);
-        }
-    }
-}
-
-/// Blocks until no process named `name` is left. A program that starts and
-/// hands over to a fresh process of its own may leave a gap; the first
-/// look is repeated [`HANDOVER_CHECKS`] times, [`HANDOVER_GRACE`] apart,
-/// before an empty result counts.
-pub fn wait_for_processes_named(name: &str) {
-    let mut checks = HANDOVER_CHECKS;
-    loop {
-        let pids = processes_named(name);
-        if pids.is_empty() {
-            if checks == 0 {
-                return;
-            }
-            checks -= 1;
-            thread::sleep(HANDOVER_GRACE);
-            continue;
-        }
-        checks = 0;
-        wait_all(&pids);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::icon;
+    use crate::launcher::kanali_path;
 
     #[test]
     fn structure_layouts() {
         assert_eq!(mem::size_of::<NOTIFYICONDATAW>(), 976);
         assert_eq!(mem::size_of::<ICONINFO>(), 32);
         assert_eq!(mem::size_of::<BITMAPINFOHEADER>(), 40);
-        assert_eq!(mem::size_of::<PROCESSENTRY32W>(), 568);
-    }
-
-    #[test]
-    fn icon_source_paths_lose_quotes_and_indices() {
-        assert_eq!(icon_source_path(r"C:\P\KANALI.exe"), r"C:\P\KANALI.exe");
-        assert_eq!(icon_source_path(r"C:\P\KANALI.exe,0"), r"C:\P\KANALI.exe");
-        assert_eq!(icon_source_path(r"C:\P\KANALI.exe, -1"), r"C:\P\KANALI.exe");
-        assert_eq!(icon_source_path(r#""C:\P q\KANALI.exe",0"#), r"C:\P q\KANALI.exe");
-        assert_eq!(icon_source_path(r"C:\a,b\KANALI.exe"), r"C:\a,b\KANALI.exe");
-        assert_eq!(icon_source_path("  "), "");
     }
 
     #[test]
@@ -486,23 +372,16 @@ mod tests {
     }
 
     #[test]
-    fn the_own_process_is_not_listed_but_a_shell_is_findable() {
-        let exe = std::env::current_exe().unwrap();
-        let name = exe.file_name().unwrap().to_string_lossy().to_string();
-        let own = std::process::id();
-        assert!(!processes_named(&name).contains(&own));
-        assert!(processes_named("no-such-program-ezrama.exe").is_empty());
+    fn the_boxed_icon_is_built_with_or_without_a_program() {
+        let plain = boxed_program_icon(None).unwrap();
+        assert_eq!(icon_pixels(plain.handle()).unwrap().size, small_icon_size());
+        let labelled = boxed_program_icon(kanali_path().as_deref()).unwrap();
+        assert!(!labelled.handle().is_null());
     }
 
     #[test]
-    fn kanali_path_when_present_is_a_file_named_kanali() {
+    fn the_installed_program_icon_comes_in_two_sizes() {
         if let Some(path) = kanali_path() {
-            assert!(path.is_file());
-            assert!(path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(KANALI_EXE));
             let small = program_icon(&path, 10).expect("the installed program has an icon");
             assert!(small.size >= 10);
             assert!(small.has_alpha());
@@ -511,5 +390,15 @@ mod tests {
             let largest = program_icon(&path, 4096).unwrap();
             assert_eq!(largest.size, large.size);
         }
+        assert_eq!(program_icon(Path::new(r"C:\ezrama-no-such-program.exe"), 16), None);
+    }
+
+    #[test]
+    fn menus_are_created_and_destroyed() {
+        let menu = Menu::new().unwrap();
+        menu.item(1, "One", true);
+        menu.separator();
+        menu.item(2, "Two", false);
+        drop(menu);
     }
 }

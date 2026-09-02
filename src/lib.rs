@@ -12,6 +12,8 @@ pub mod wire;
 #[cfg(windows)]
 pub mod install;
 #[cfg(windows)]
+pub mod launcher;
+#[cfg(windows)]
 pub mod overlapped;
 #[cfg(windows)]
 pub mod tray;

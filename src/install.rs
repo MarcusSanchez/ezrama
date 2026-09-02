@@ -2,7 +2,6 @@
 //! under local app data and a Run entry that starts it at logon.
 
 use std::fs;
-use std::mem;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
@@ -284,75 +283,6 @@ pub fn copy_binary(source: &Path, destination: &Path) -> std::io::Result<u64> {
     fs::copy(source, destination)
 }
 
-/// A process started by [`start_detached`]: its id and a handle to wait on.
-pub struct Process {
-    handle: HANDLE,
-    id: u32,
-}
-
-// Process handles may be used from any thread.
-unsafe impl Send for Process {}
-
-impl Process {
-    pub fn id(&self) -> u32 {
-        self.id
-    }
-
-    /// Blocks until the process exits.
-    pub fn wait(&self) {
-        unsafe {
-            WaitForSingleObject(self.handle, INFINITE);
-        }
-    }
-}
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.handle);
-        }
-    }
-}
-
-/// Starts `program` with `arguments`, in `directory` when given, detached
-/// from any console and without this process's handles. A shell pipeline
-/// that ran ezrama is therefore not held open by the new process.
-pub fn start_detached(
-    program: &Path,
-    arguments: &str,
-    directory: Option<&Path>,
-) -> Result<Process, WinError> {
-    let application = wide(&program.to_string_lossy());
-    let mut command_line = wide(&format!("\"{}\" {arguments}", program.display()));
-    let directory = directory.map(|directory| wide(&directory.to_string_lossy()));
-    let mut startup: STARTUPINFOW = unsafe { mem::zeroed() };
-    startup.cb = mem::size_of::<STARTUPINFOW>() as DWORD;
-    let mut information: PROCESS_INFORMATION = unsafe { mem::zeroed() };
-    let created = unsafe {
-        CreateProcessW(
-            application.as_ptr(),
-            command_line.as_mut_ptr(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            0,
-            DETACHED_PROCESS,
-            ptr::null_mut(),
-            directory.as_ref().map_or(ptr::null(), |d| d.as_ptr()),
-            &startup,
-            &mut information,
-        )
-    };
-    if created == 0 {
-        return Err(WinError::last("CreateProcessW"));
-    }
-    unsafe {
-        CloseHandle(information.hThread);
-    }
-    Ok(Process {
-        handle: information.hProcess,
-        id: information.dwProcessId,
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -381,18 +311,6 @@ mod tests {
         bytes.extend_from_slice(&[0, 0, b'z', 0]);
         assert_eq!(utf16_string(&bytes), "ab");
         assert_eq!(utf16_string(&[]), "");
-    }
-
-    #[test]
-    fn detached_processes_start_and_can_be_waited_for() {
-        assert_eq!(mem::size_of::<STARTUPINFOW>(), 104);
-        assert_eq!(mem::size_of::<PROCESS_INFORMATION>(), 24);
-        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
-        let process = start_detached(&system.join("cmd.exe"), "/c exit 0", Some(&system)).unwrap();
-        assert_ne!(process.id(), 0);
-        process.wait();
-        let missing = start_detached(Path::new(r"C:\ezrama-no-such-program.exe"), "", None);
-        assert_eq!(missing.err().map(|error| error.code), Some(ERROR_FILE_NOT_FOUND));
     }
 
     #[test]

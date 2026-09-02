@@ -566,7 +566,7 @@ fn run(verbose: bool, interval: Duration) -> ExitCode {
 #[cfg(windows)]
 fn watch(verbose: bool, interval: Duration) -> ExitCode {
     use crate::hold::{hold, HoldEvent, KEEPALIVE_WRITE_RETRIES};
-    use crate::icon;
+    use crate::launcher;
     use crate::log::{default_log_path, Logger};
     use crate::tray;
     use crate::usbprint::{self, Device, Discovery};
@@ -596,17 +596,12 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
     };
 
     tray::enable_dpi_awareness();
-    let kanali = tray::kanali_path();
+    let kanali = launcher::kanali_path();
     match &kanali {
         Some(path) => log.log(&format!("KANALI found at {}", path.display())),
         None => log.log("KANALI not found; the menu cannot start it"),
     }
-    let size = tray::small_icon_size();
-    let label = kanali
-        .as_deref()
-        .and_then(|path| tray::program_icon(path, icon::layout(size).label));
-    let image = icon::boxed(size, label.as_ref());
-    let icon = match tray::create_icon(&image) {
+    let icon = match tray::boxed_program_icon(kanali.as_deref()) {
         Ok(icon) => Some(icon),
         Err(error) => {
             log.log(&format!("notification icon unavailable: {error}"));
@@ -670,12 +665,12 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
     /// Starts KANALI and, on its own thread, waits for every KANALI
     /// process to exit before reporting back.
     fn launch_kanali(path: &Path, log: &mut Logger) -> bool {
-        match tray::launch(path) {
+        match launcher::launch(path) {
             Ok(process) => {
                 log.log(&format!("started KANALI (process {})", process.id()));
                 thread::spawn(move || {
                     process.wait();
-                    tray::wait_for_processes_named(tray::KANALI_EXE);
+                    launcher::wait_for_processes_named(launcher::KANALI_EXE);
                     window::post_event(Event::KanaliClosed);
                 });
                 true
@@ -929,7 +924,7 @@ fn stop_watcher_and_wait() -> bool {
 /// Starts the windowless watcher at `watcher`, detached from this process.
 #[cfg(windows)]
 fn spawn_watcher(watcher: &std::path::Path) -> Result<u32, crate::usbprint::WinError> {
-    crate::install::start_detached(watcher, "watch", None).map(|process| process.id())
+    crate::launcher::start_detached(watcher, "watch", None).map(|process| process.id())
 }
 
 /// Copies the binaries next to the log, registers the logon entry, and

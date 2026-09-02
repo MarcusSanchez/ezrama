@@ -291,7 +291,7 @@ unsafe fn broadcast_path(lparam: LPARAM) -> Option<String> {
 /// Builds the menu for the current state, shows it, and acts on the
 /// choice.
 fn show_menu(window: HWND) {
-    let Some(menu) = Menu::new() else {
+    let Ok(menu) = Menu::new() else {
         return;
     };
     let state = state();
