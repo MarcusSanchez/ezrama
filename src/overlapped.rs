@@ -522,7 +522,7 @@ mod tests {
             ResetEvent(interrupt);
         }
         let read = transport.read(Duration::from_millis(100));
-        assert!(matches!(read, Ok(_)), "after the interrupt clears, reads work: {read:?}");
+        assert!(read.is_ok(), "after the interrupt clears, reads work: {read:?}");
         assert!(!matches!(transport.disarm_read(), Disarm::Abandoned));
         unsafe {
             CloseHandle(interrupt);
