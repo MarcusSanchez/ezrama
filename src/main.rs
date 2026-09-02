@@ -10,25 +10,40 @@ Commands:
   probe      Find the Panorama SE printer interface and open it briefly
   info       Start a session and print the device's state; changes nothing
   activate   Start a session and switch the panel to its stored media once
+  run        Start a session and hold it with keepalive pings until Ctrl+C
   help       Show this message
   version    Print the version
 
 Options:
-  -v, --verbose    Show every printer-class interface and check exclusivity
-  --io             With probe: arm one read, cancel it, and reap it
+  -v, --verbose        Extra detail: interfaces and exclusivity for probe,
+                       one line per ping for run
+  --io                 With probe: arm one read, cancel it, and reap it
+  --interval <secs>    With run: seconds between pings (default 2)
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
     let io_check = args.iter().any(|a| a == "--io");
-    let command = args.iter().find(|a| !a.starts_with('-')).map(String::as_str);
+    let interval = interval_argument(&args);
+    let command = args
+        .iter()
+        .enumerate()
+        .find(|(index, a)| !a.starts_with('-') && !is_option_value(&args, *index))
+        .map(|(_, a)| a.as_str());
     let wants_version = args.iter().any(|a| a == "--version" || a == "-V");
     let wants_help = args.iter().any(|a| a == "--help" || a == "-h");
     match command {
         Some("probe") => probe(verbose, io_check),
         Some("info") => info(),
         Some("activate") => activate(),
+        Some("run") => match interval {
+            Ok(interval) => run(verbose, interval),
+            Err(message) => {
+                eprintln!("{message}");
+                ExitCode::from(2)
+            }
+        },
         Some("version") => {
             println!("{NAME} {VERSION}");
             ExitCode::SUCCESS
@@ -320,22 +335,16 @@ fn info() -> ExitCode {
     }
 }
 
-/// Starts a session, sends the activation trigger and one Ping, reports
-/// which media the panel is configured to show, and exits.
+/// Opens the display and runs the session start: bootstrap, the activation
+/// trigger, and the first Ping. Prints each step.
 #[cfg(windows)]
-fn activate() -> ExitCode {
+fn start_session() -> Result<ezrama::session::Session<ezrama::overlapped::UsbprintTransport>, ExitCode> {
     use ezrama::overlapped::UsbprintTransport;
     use ezrama::session::{KeepaliveOutcome, OptionalReply, Session};
     use std::time::Instant;
 
-    let path = match win_cli::locate() {
-        Ok(path) => path,
-        Err(code) => return code,
-    };
-    let device = match win_cli::open(&path) {
-        Ok(device) => device,
-        Err(code) => return code,
-    };
+    let path = win_cli::locate()?;
+    let device = win_cli::open(&path)?;
     let mut session = Session::new(UsbprintTransport::new(device));
 
     let started = Instant::now();
@@ -343,7 +352,7 @@ fn activate() -> ExitCode {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
             eprintln!("session start failed: {error}");
-            return ExitCode::from(1);
+            return Err(ExitCode::from(1));
         }
     };
     println!(
@@ -359,7 +368,7 @@ fn activate() -> ExitCode {
         Ok(OptionalReply::Drained) => println!("activation trigger sent; an unrelated frame was consumed"),
         Err(error) => {
             eprintln!("activation failed: {error}");
-            return ExitCode::from(1);
+            return Err(ExitCode::from(1));
         }
     }
 
@@ -369,10 +378,20 @@ fn activate() -> ExitCode {
         KeepaliveOutcome::Retryable(error) => println!("ping did not transfer: {error}"),
         KeepaliveOutcome::Fatal(error) => {
             eprintln!("ping failed: {error}");
-            return ExitCode::from(1);
+            return Err(ExitCode::from(1));
         }
     }
+    Ok(session)
+}
 
+/// Starts a session, reports which media the panel is configured to show,
+/// and exits without holding the session.
+#[cfg(windows)]
+fn activate() -> ExitCode {
+    let mut session = match start_session() {
+        Ok(session) => session,
+        Err(code) => return code,
+    };
     match session.query_user_configuration() {
         Ok(config) => match config.work {
             Some(work) => println!("panel is configured to show {}", show(&work.single_mode_media_file)),
@@ -383,8 +402,110 @@ fn activate() -> ExitCode {
             return ExitCode::from(1);
         }
     }
-    println!("done in {} ms", started.elapsed().as_millis());
     ExitCode::SUCCESS
+}
+
+/// Console control events turn into a stop request for the holding loop.
+#[cfg(windows)]
+mod stop_signal {
+    use ezrama::win::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "system" fn handler(ctrl_type: DWORD) -> BOOL {
+        match ctrl_type {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT => {
+                STOP.store(true, Ordering::SeqCst);
+                1
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn install() -> bool {
+        unsafe { SetConsoleCtrlHandler(Some(handler), 1) != 0 }
+    }
+
+    pub fn requested() -> bool {
+        STOP.load(Ordering::SeqCst)
+    }
+}
+
+/// Starts a session and holds it with periodic Pings until Ctrl+C or loss.
+#[cfg(windows)]
+fn run(verbose: bool, interval: std::time::Duration) -> ExitCode {
+    use ezrama::hold::{hold, HoldEvent, KEEPALIVE_WRITE_RETRIES};
+    use ezrama::session::OptionalReply;
+
+    let mut session = match start_session() {
+        Ok(session) => session,
+        Err(code) => return code,
+    };
+    if !stop_signal::install() {
+        eprintln!("could not install the console stop handler; use the task manager to stop");
+    }
+    println!(
+        "holding the session: ping every {} ms; press Ctrl+C to stop",
+        interval.as_millis()
+    );
+
+    let last_outbound = session.now();
+    let mut pings = 0u64;
+    let result = hold(
+        &mut session,
+        interval,
+        last_outbound,
+        &stop_signal::requested,
+        &mut |event| match event {
+            HoldEvent::Pinged(reply) => {
+                pings += 1;
+                if verbose {
+                    let reply = match reply {
+                        OptionalReply::None => "no reply",
+                        OptionalReply::Acknowledged => "acknowledged",
+                        OptionalReply::Drained => "reply consumed",
+                    };
+                    println!("ping {pings}: {reply}");
+                }
+            }
+            HoldEvent::Retrying { attempt, error } => {
+                println!("ping retry {attempt} of {KEEPALIVE_WRITE_RETRIES}: {error}");
+            }
+            HoldEvent::Stopped => println!("stop requested after {pings} pings"),
+        },
+    );
+    match result {
+        Ok(()) => {
+            println!("session released");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("session lost after {pings} pings: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Parses `--interval <seconds>`; the reference's 2 s when absent.
+fn interval_argument(args: &[String]) -> Result<std::time::Duration, String> {
+    use std::time::Duration;
+
+    let Some(position) = args.iter().position(|a| a == "--interval") else {
+        return Ok(Duration::from_millis(2000));
+    };
+    let Some(value) = args.get(position + 1) else {
+        return Err("--interval needs a value in seconds".to_string());
+    };
+    match value.parse::<f64>() {
+        Ok(seconds) if (0.1..=3600.0).contains(&seconds) => Ok(Duration::from_secs_f64(seconds)),
+        _ => Err(format!("--interval must be between 0.1 and 3600 seconds, not {value}")),
+    }
+}
+
+/// Whether the argument at `index` is the value of a preceding option.
+fn is_option_value(args: &[String], index: usize) -> bool {
+    index > 0 && args[index - 1] == "--interval"
 }
 
 /// Renders a device string, making an empty one visible.
@@ -411,5 +532,11 @@ fn info() -> ExitCode {
 #[cfg(not(windows))]
 fn activate() -> ExitCode {
     eprintln!("activate is only available on Windows");
+    ExitCode::from(1)
+}
+
+#[cfg(not(windows))]
+fn run(_verbose: bool, _interval: std::time::Duration) -> ExitCode {
+    eprintln!("run is only available on Windows");
     ExitCode::from(1)
 }

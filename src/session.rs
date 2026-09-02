@@ -239,6 +239,16 @@ impl<T: Transport> Session<T> {
         self.transport
     }
 
+    /// The session's idea of now.
+    pub fn now(&mut self) -> Instant {
+        self.clock.now()
+    }
+
+    /// Pauses on the session's clock.
+    pub fn sleep(&mut self, duration: Duration) {
+        self.clock.sleep(duration);
+    }
+
     /// Closes the session, recording `error` as the reason, and returns it.
     pub(crate) fn close(&mut self, error: SessionError) -> SessionError {
         if self.closed.is_none() {
@@ -674,13 +684,69 @@ fn framed(payload: &[u8]) -> Result<Vec<u8>, SessionError> {
     frame::encode(payload).map_err(SessionError::Frame)
 }
 
+/// Test doubles shared by the session and holding tests.
+#[cfg(test)]
+pub mod testing {
+    use super::Clock;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// A clock that only moves when the session sleeps.
+    #[derive(Clone)]
+    pub struct FakeClock {
+        base: Instant,
+        offset: Arc<Mutex<Duration>>,
+        sleeps: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl Default for FakeClock {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl FakeClock {
+        pub fn new() -> Self {
+            Self {
+                base: Instant::now(),
+                offset: Arc::new(Mutex::new(Duration::ZERO)),
+                sleeps: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        pub fn sleeps_ms(&self) -> Vec<u64> {
+            self.sleeps
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|d| d.as_millis() as u64)
+                .collect()
+        }
+
+        pub fn elapsed(&self) -> Duration {
+            *self.offset.lock().unwrap()
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&mut self) -> Instant {
+            self.base + *self.offset.lock().unwrap()
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.sleeps.lock().unwrap().push(duration);
+            *self.offset.lock().unwrap() += duration;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::FakeClock;
     use super::*;
     use crate::frame::{encode, MAX_RESYNC_BYTES};
     use crate::pb::Message;
     use crate::transport::MockTransport;
-    use std::sync::{Arc, Mutex};
 
     fn soon() -> Instant {
         Instant::now() + Duration::from_millis(200)
@@ -895,44 +961,6 @@ mod tests {
         let mut budget = SkipBudget::default();
         assert!(budget.skip(MAX_SKIPPED_BYTES - 8));
         assert!(!budget.skip(0));
-    }
-
-    /// A clock that only moves when the session sleeps.
-    #[derive(Clone)]
-    struct FakeClock {
-        base: Instant,
-        offset: Arc<Mutex<Duration>>,
-        sleeps: Arc<Mutex<Vec<Duration>>>,
-    }
-
-    impl FakeClock {
-        fn new() -> Self {
-            Self {
-                base: Instant::now(),
-                offset: Arc::new(Mutex::new(Duration::ZERO)),
-                sleeps: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn sleeps_ms(&self) -> Vec<u64> {
-            self.sleeps
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|d| d.as_millis() as u64)
-                .collect()
-        }
-    }
-
-    impl Clock for FakeClock {
-        fn now(&mut self) -> Instant {
-            self.base + *self.offset.lock().unwrap()
-        }
-
-        fn sleep(&mut self, duration: Duration) {
-            self.sleeps.lock().unwrap().push(duration);
-            *self.offset.lock().unwrap() += duration;
-        }
     }
 
     fn bootstrap_session(mock: MockTransport) -> (Session<MockTransport>, FakeClock) {

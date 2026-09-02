@@ -33,6 +33,12 @@ pub const WAIT_OBJECT_0: DWORD = 0;
 pub const WAIT_TIMEOUT: DWORD = 258;
 pub const WAIT_FAILED: DWORD = 0xffff_ffff;
 
+pub const CTRL_C_EVENT: DWORD = 0;
+pub const CTRL_BREAK_EVENT: DWORD = 1;
+pub const CTRL_CLOSE_EVENT: DWORD = 2;
+
+pub type PHANDLER_ROUTINE = Option<unsafe extern "system" fn(CtrlType: DWORD) -> BOOL>;
+
 pub const DIGCF_PRESENT: DWORD = 0x0000_0002;
 pub const DIGCF_DEVICEINTERFACE: DWORD = 0x0000_0010;
 
@@ -160,4 +166,5 @@ extern "system" {
         lpNumberOfBytesTransferred: *mut DWORD,
         bWait: BOOL,
     ) -> BOOL;
+    pub fn SetConsoleCtrlHandler(HandlerRoutine: PHANDLER_ROUTINE, Add: BOOL) -> BOOL;
 }
