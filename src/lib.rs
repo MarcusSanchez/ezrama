@@ -1,5 +1,6 @@
 pub mod frame;
 pub mod pb;
+pub mod session;
 pub mod transport;
 pub mod wire;
 
