@@ -1,5 +1,6 @@
-//! Hand-declared Win32 bindings for the handful of calls the transport
-//! needs.
+//! Hand-declared Win32 bindings for the calls the program needs: device
+//! discovery and I/O, the watcher's window, the notification-area icon,
+//! the registry, and process waits.
 
 #![allow(non_camel_case_types, non_snake_case, clippy::upper_case_acronyms)]
 
@@ -68,6 +69,7 @@ pub type HKEY = *mut c_void;
 pub type LSTATUS = i32;
 
 pub const HKEY_CURRENT_USER: HKEY = 0x8000_0001usize as HKEY;
+pub const HKEY_LOCAL_MACHINE: HKEY = 0x8000_0002usize as HKEY;
 pub const KEY_QUERY_VALUE: DWORD = 0x0001;
 pub const KEY_SET_VALUE: DWORD = 0x0002;
 pub const REG_SZ: DWORD = 1;
@@ -344,4 +346,185 @@ extern "system" {
     pub fn OpenEventW(dwDesiredAccess: DWORD, bInheritHandle: BOOL, lpName: *const u16) -> HANDLE;
     pub fn SetEvent(hEvent: HANDLE) -> BOOL;
     pub fn ResetEvent(hEvent: HANDLE) -> BOOL;
+}
+
+pub type HICON = HANDLE;
+pub type HBITMAP = HANDLE;
+pub type HDC = HANDLE;
+pub type HMENU = HANDLE;
+
+pub const SM_CXSMICON: i32 = 49;
+pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: HANDLE = -4isize as HANDLE;
+
+pub const WM_NULL: u32 = 0x0000;
+pub const WM_CONTEXTMENU: u32 = 0x007b;
+pub const NIN_SELECT: u32 = 0x0400;
+pub const NIN_KEYSELECT: u32 = 0x0401;
+
+pub const NIM_ADD: DWORD = 0;
+pub const NIM_MODIFY: DWORD = 1;
+pub const NIM_DELETE: DWORD = 2;
+pub const NIM_SETVERSION: DWORD = 4;
+pub const NIF_MESSAGE: DWORD = 0x01;
+pub const NIF_ICON: DWORD = 0x02;
+pub const NIF_TIP: DWORD = 0x04;
+pub const NIF_SHOWTIP: DWORD = 0x80;
+pub const NOTIFYICON_VERSION_4: DWORD = 4;
+
+pub const MF_STRING: DWORD = 0x0000;
+pub const MF_GRAYED: DWORD = 0x0001;
+pub const MF_SEPARATOR: DWORD = 0x0800;
+pub const TPM_RIGHTBUTTON: DWORD = 0x0002;
+pub const TPM_NONOTIFY: DWORD = 0x0080;
+pub const TPM_RETURNCMD: DWORD = 0x0100;
+
+pub const SMTO_ABORTIFHUNG: DWORD = 0x0002;
+
+pub const DIB_RGB_COLORS: DWORD = 0;
+pub const BI_RGB: DWORD = 0;
+
+pub const TH32CS_SNAPPROCESS: DWORD = 0x0002;
+pub const INFINITE: DWORD = 0xffff_ffff;
+
+#[repr(C)]
+pub struct NOTIFYICONDATAW {
+    pub cbSize: DWORD,
+    pub hWnd: HWND,
+    pub uID: u32,
+    pub uFlags: DWORD,
+    pub uCallbackMessage: u32,
+    pub hIcon: HICON,
+    pub szTip: [u16; 128],
+    pub dwState: DWORD,
+    pub dwStateMask: DWORD,
+    pub szInfo: [u16; 256],
+    pub uVersion: u32,
+    pub szInfoTitle: [u16; 64],
+    pub dwInfoFlags: DWORD,
+    pub guidItem: GUID,
+    pub hBalloonIcon: HICON,
+}
+
+#[repr(C)]
+pub struct ICONINFO {
+    pub fIcon: BOOL,
+    pub xHotspot: DWORD,
+    pub yHotspot: DWORD,
+    pub hbmMask: HBITMAP,
+    pub hbmColor: HBITMAP,
+}
+
+#[repr(C)]
+pub struct BITMAPINFOHEADER {
+    pub biSize: DWORD,
+    pub biWidth: i32,
+    pub biHeight: i32,
+    pub biPlanes: u16,
+    pub biBitCount: u16,
+    pub biCompression: DWORD,
+    pub biSizeImage: DWORD,
+    pub biXPelsPerMeter: i32,
+    pub biYPelsPerMeter: i32,
+    pub biClrUsed: DWORD,
+    pub biClrImportant: DWORD,
+}
+
+#[repr(C)]
+pub struct BITMAPINFO {
+    pub bmiHeader: BITMAPINFOHEADER,
+    pub bmiColors: [u32; 1],
+}
+
+#[repr(C)]
+pub struct PROCESSENTRY32W {
+    pub dwSize: DWORD,
+    pub cntUsage: DWORD,
+    pub th32ProcessID: DWORD,
+    pub th32DefaultHeapID: usize,
+    pub th32ModuleID: DWORD,
+    pub cntThreads: DWORD,
+    pub th32ParentProcessID: DWORD,
+    pub pcPriClassBase: i32,
+    pub dwFlags: DWORD,
+    pub szExeFile: [u16; 260],
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    pub fn Shell_NotifyIconW(dwMessage: DWORD, lpData: *mut NOTIFYICONDATAW) -> BOOL;
+    pub fn ExtractIconExW(
+        lpszFile: *const u16,
+        nIconIndex: i32,
+        phiconLarge: *mut HICON,
+        phiconSmall: *mut HICON,
+        nIcons: u32,
+    ) -> u32;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn GetSystemMetrics(nIndex: i32) -> i32;
+    pub fn SetProcessDpiAwarenessContext(value: HANDLE) -> BOOL;
+    pub fn RegisterWindowMessageW(lpString: *const u16) -> u32;
+    pub fn SendMessageTimeoutW(
+        hWnd: HWND,
+        Msg: u32,
+        wParam: WPARAM,
+        lParam: LPARAM,
+        fuFlags: DWORD,
+        uTimeout: u32,
+        lpdwResult: *mut usize,
+    ) -> LRESULT;
+    pub fn SetForegroundWindow(hWnd: HWND) -> BOOL;
+    pub fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
+    pub fn CreatePopupMenu() -> HMENU;
+    pub fn AppendMenuW(hMenu: HMENU, uFlags: DWORD, uIDNewItem: usize, lpNewItem: *const u16) -> BOOL;
+    pub fn TrackPopupMenu(
+        hMenu: HMENU,
+        uFlags: DWORD,
+        x: i32,
+        y: i32,
+        nReserved: i32,
+        hWnd: HWND,
+        prcRect: *const c_void,
+    ) -> BOOL;
+    pub fn DestroyMenu(hMenu: HMENU) -> BOOL;
+    pub fn GetIconInfo(hIcon: HICON, piconinfo: *mut ICONINFO) -> BOOL;
+    pub fn CreateIconIndirect(piconinfo: *const ICONINFO) -> HICON;
+    pub fn DestroyIcon(hIcon: HICON) -> BOOL;
+    pub fn GetDC(hWnd: HWND) -> HDC;
+    pub fn ReleaseDC(hWnd: HWND, hDC: HDC) -> i32;
+}
+
+#[link(name = "gdi32")]
+extern "system" {
+    pub fn GetDIBits(
+        hdc: HDC,
+        hbm: HBITMAP,
+        start: u32,
+        cLines: u32,
+        lpvBits: *mut c_void,
+        lpbmi: *mut BITMAPINFO,
+        usage: DWORD,
+    ) -> i32;
+    pub fn CreateDIBSection(
+        hdc: HDC,
+        pbmi: *const BITMAPINFO,
+        usage: DWORD,
+        ppvBits: *mut *mut c_void,
+        hSection: HANDLE,
+        offset: DWORD,
+    ) -> HBITMAP;
+    pub fn CreateBitmap(nWidth: i32, nHeight: i32, nPlanes: u32, nBitCount: u32, lpBits: *const c_void) -> HBITMAP;
+    pub fn DeleteObject(ho: HANDLE) -> BOOL;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    pub fn CreateToolhelp32Snapshot(dwFlags: DWORD, th32ProcessID: DWORD) -> HANDLE;
+    pub fn Process32FirstW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
+    pub fn Process32NextW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
+    pub fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) -> HANDLE;
+    pub fn WaitForMultipleObjects(nCount: DWORD, lpHandles: *const HANDLE, bWaitAll: BOOL, dwMilliseconds: DWORD) -> DWORD;
+    pub fn GetCurrentProcessId() -> DWORD;
 }

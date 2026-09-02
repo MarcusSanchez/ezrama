@@ -14,9 +14,11 @@ Commands:
   info       Start a session and print the device's state; changes nothing
   activate   Start a session and switch the panel to its stored media once
   run        Start a session and hold it with keepalive pings until Ctrl+C
-  watch      Hold a session whenever the panel is present; made for autostart
+  watch      Hold a session whenever the panel is present, with a tray icon
   pause      Ask the running watcher to release the panel and wait for it
   resume     Ask the running watcher to take the panel back
+  kanali     Ask the running watcher to release the panel, start KANALI, and
+             take the panel back once KANALI exits
   stop       Ask the running watcher to exit
   install    Copy the binaries to local app data, start the watcher at logon
   uninstall  Stop the watcher and remove the logon entry and the binaries
@@ -43,6 +45,7 @@ const PAUSE_CONFIRMATION: Duration = Duration::from_secs(5);
 enum WatcherRequest {
     Pause,
     Resume,
+    OpenKanali,
     Stop,
 }
 
@@ -77,6 +80,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         },
         Some("pause") => control(WatcherRequest::Pause),
         Some("resume") => control(WatcherRequest::Resume),
+        Some("kanali") => control(WatcherRequest::OpenKanali),
         Some("stop") => control(WatcherRequest::Stop),
         Some("install") => install(),
         Some("uninstall") => uninstall(),
@@ -483,8 +487,8 @@ mod stop_signal {
         match ctrl_type {
             CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT => {
                 STOP.store(true, Ordering::SeqCst);
-                crate::devnotify::interrupt();
-                crate::devnotify::request_stop();
+                crate::window::interrupt();
+                crate::window::request_stop();
                 1
             }
             _ => 0,
@@ -557,14 +561,18 @@ fn run(verbose: bool, interval: Duration) -> ExitCode {
 
 /// Keeps a session whenever the display is present. Reacts to the display
 /// arriving and leaving, retries a failed session start with growing
-/// pauses, and writes a log file.
+/// pauses, shows a notification-area icon with a menu, and writes a log
+/// file.
 #[cfg(windows)]
 fn watch(verbose: bool, interval: Duration) -> ExitCode {
-    use crate::devnotify;
     use crate::hold::{hold, HoldEvent, KEEPALIVE_WRITE_RETRIES};
+    use crate::icon;
     use crate::log::{default_log_path, Logger};
+    use crate::tray;
     use crate::usbprint::{self, Device, Discovery};
-    use crate::watch::{Control, Directive, Event, Reconnect};
+    use crate::watch::{Control, Directive, Event, Reconnect, State};
+    use crate::window::{self, Setup};
+    use std::path::Path;
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::thread;
 
@@ -579,7 +587,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
     if !stop_signal::install() {
         log.log("console stop handler unavailable");
     }
-    let paused_signal = match devnotify::PausedSignal::create() {
+    let paused_signal = match window::PausedSignal::create() {
         Ok(signal) => Some(signal),
         Err(error) => {
             log.log(&format!("pause confirmation unavailable: {error}"));
@@ -587,8 +595,31 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
         }
     };
 
+    tray::enable_dpi_awareness();
+    let kanali = tray::kanali_path();
+    match &kanali {
+        Some(path) => log.log(&format!("KANALI found at {}", path.display())),
+        None => log.log("KANALI not found; the menu cannot start it"),
+    }
+    let size = tray::small_icon_size();
+    let label = kanali
+        .as_deref()
+        .and_then(|path| tray::program_icon(path, icon::layout(size).label));
+    let image = icon::boxed(size, label.as_ref());
+    let icon = match tray::create_icon(&image) {
+        Ok(icon) => Some(icon),
+        Err(error) => {
+            log.log(&format!("notification icon unavailable: {error}"));
+            None
+        }
+    };
+    let setup = Setup {
+        icon,
+        kanali_available: kanali.is_some(),
+    };
+
     let (sender, events) = mpsc::channel::<Event>();
-    let pump = thread::spawn(move || devnotify::run_message_loop(sender));
+    let pump = thread::spawn(move || window::run_message_loop(sender, setup));
 
     /// Applies one event to the control state and logs it.
     fn apply(event: Event, control: &mut Control, log: &mut Logger) -> Directive {
@@ -597,6 +628,8 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
             Event::Removed(path) => log.log(&format!("panel removed: {path}")),
             Event::Pause => log.log("pause requested"),
             Event::Resume => log.log("resume requested"),
+            Event::OpenKanali => log.log("KANALI requested"),
+            Event::KanaliClosed => log.log("KANALI has exited"),
             Event::Quit => log.log("stop requested"),
         }
         control.apply(&event)
@@ -634,22 +667,60 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
         apply(event, control, log)
     }
 
+    /// Starts KANALI and, on its own thread, waits for every KANALI
+    /// process to exit before reporting back.
+    fn launch_kanali(path: &Path, log: &mut Logger) -> bool {
+        match tray::launch(path) {
+            Ok(mut child) => {
+                log.log(&format!("started KANALI (process {})", child.id()));
+                thread::spawn(move || {
+                    let _ = child.wait();
+                    tray::wait_for_processes_named(tray::KANALI_EXE);
+                    window::post_event(Event::KanaliClosed);
+                });
+                true
+            }
+            Err(error) => {
+                log.log(&format!("could not start KANALI: {error}"));
+                false
+            }
+        }
+    }
+
     let mut reconnect = Reconnect::new();
     let mut control = Control::new();
-    let mut announced_pause = false;
+    let mut announced: Option<State> = None;
     loop {
         if stop_signal::requested() || drain(&events, &mut control, &mut log) == Directive::Quit {
             break;
         }
-        devnotify::clear_interrupt();
+        window::clear_interrupt();
 
         if control.paused() {
             if let Some(signal) = &paused_signal {
                 signal.set();
             }
-            if !announced_pause {
-                log.log("paused: the panel is released until resume");
-                announced_pause = true;
+            if control.take_launch() {
+                let started = match &kanali {
+                    Some(path) => launch_kanali(path, &mut log),
+                    None => {
+                        log.log("KANALI is not installed");
+                        false
+                    }
+                };
+                if !started {
+                    control.apply(&Event::KanaliClosed);
+                    continue;
+                }
+            }
+            let state = control.paused_state();
+            window::set_state(state);
+            if announced != Some(state) {
+                log.log(match state {
+                    State::WaitingForKanali => "paused until KANALI exits",
+                    _ => "paused: the panel is released until resume",
+                });
+                announced = Some(state);
             }
             if wait(&events, None, &mut control, &mut log) == Directive::Quit {
                 break;
@@ -659,11 +730,12 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
         if let Some(signal) = &paused_signal {
             signal.clear();
         }
-        announced_pause = false;
+        announced = None;
 
         let path = match usbprint::find_panorama() {
             Ok(Discovery::One(path)) => path,
             Ok(Discovery::Absent) => {
+                window::set_state(State::NoDisplay);
                 log.log("panel not present; waiting");
                 if wait(&events, None, &mut control, &mut log) == Directive::Quit {
                     break;
@@ -671,6 +743,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
                 continue;
             }
             Ok(Discovery::Several(paths)) => {
+                window::set_state(State::NoDisplay);
                 log.log(&format!("{} panels present; waiting for exactly one", paths.len()));
                 if wait(&events, None, &mut control, &mut log) == Directive::Quit {
                     break;
@@ -678,6 +751,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
                 continue;
             }
             Err(error) => {
+                window::set_state(State::Connecting);
                 log.log(&format!("discovery failed: {error}"));
                 if wait(&events, Some(reconnect.next_delay()), &mut control, &mut log)
                     == Directive::Quit
@@ -688,6 +762,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
             }
         };
 
+        window::set_state(State::Connecting);
         let started = Device::open(&path)
             .map_err(|error| error.to_string())
             .and_then(|device| win_cli::establish(device, &mut |line| log.log(line)));
@@ -703,6 +778,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
             }
         };
         reconnect.reset();
+        window::set_state(State::Active);
         log.log(&format!("holding: ping every {} ms", interval.as_millis()));
 
         let last_outbound = session.now();
@@ -711,7 +787,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
             &mut session,
             interval,
             last_outbound,
-            &|| devnotify::interrupted() || stop_signal::requested(),
+            &|| window::interrupted() || stop_signal::requested(),
             &mut |event| match event {
                 HoldEvent::Pinged(_, drained) => {
                     pings += 1;
@@ -729,6 +805,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
         match result {
             Ok(()) => log.log(&format!("session released after {pings} pings")),
             Err(error) => {
+                window::set_state(State::Connecting);
                 let delay = reconnect.next_delay();
                 log.log(&format!(
                     "session lost after {pings} pings: {error}; retrying in {} s",
@@ -741,8 +818,9 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
         }
     }
 
+    window::set_state(State::Quitting);
     log.log("watch stopping");
-    devnotify::request_stop();
+    window::request_stop();
     match pump.join() {
         Ok(Ok(())) => {}
         Ok(Err(error)) => log.log(&format!("device notifications failed: {error}")),
@@ -755,19 +833,20 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
 /// pause, waits for the watcher to confirm it has released the panel.
 #[cfg(windows)]
 fn control(request: WatcherRequest) -> ExitCode {
-    use crate::devnotify::{self, Request};
+    use crate::window::{self, Request};
 
     let sent = match request {
-        WatcherRequest::Pause => devnotify::control_watcher(Request::Pause),
-        WatcherRequest::Resume => devnotify::control_watcher(Request::Resume),
-        WatcherRequest::Stop => devnotify::control_watcher(Request::Stop),
+        WatcherRequest::Pause => window::control_watcher(Request::Pause),
+        WatcherRequest::Resume => window::control_watcher(Request::Resume),
+        WatcherRequest::OpenKanali => window::control_watcher(Request::OpenKanali),
+        WatcherRequest::Stop => window::control_watcher(Request::Stop),
     };
     if !sent {
         eprintln!("no ezrama watcher is running");
         return ExitCode::from(1);
     }
     match request {
-        WatcherRequest::Pause => match devnotify::wait_paused(PAUSE_CONFIRMATION) {
+        WatcherRequest::Pause => match window::wait_paused(PAUSE_CONFIRMATION) {
             Ok(true) => {
                 println!("watcher paused; the panel is released");
                 ExitCode::SUCCESS
@@ -786,6 +865,10 @@ fn control(request: WatcherRequest) -> ExitCode {
         },
         WatcherRequest::Resume => {
             println!("watcher resumed");
+            ExitCode::SUCCESS
+        }
+        WatcherRequest::OpenKanali => {
+            println!("watcher asked to start KANALI");
             ExitCode::SUCCESS
         }
         WatcherRequest::Stop => {
@@ -829,15 +912,15 @@ fn control(_request: WatcherRequest) -> ExitCode {
 /// Returns whether one was running.
 #[cfg(windows)]
 fn stop_watcher_and_wait() -> bool {
-    use crate::devnotify::{self, Request};
+    use crate::window::{self, Request};
     use std::time::Instant;
 
-    if devnotify::find_watcher().is_none() {
+    if window::find_watcher().is_none() {
         return false;
     }
-    devnotify::control_watcher(Request::Stop);
+    window::control_watcher(Request::Stop);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while devnotify::find_watcher().is_some() && Instant::now() < deadline {
+    while window::find_watcher().is_some() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
     true
@@ -981,7 +1064,7 @@ fn uninstall() -> ExitCode {
 /// Reports the installation, the watcher, and the panel.
 #[cfg(windows)]
 fn status() -> ExitCode {
-    use crate::devnotify;
+    use crate::window;
     use crate::install::*;
     use crate::usbprint::{self, Discovery};
 
@@ -1011,12 +1094,11 @@ fn status() -> ExitCode {
         }
         Err(error) => println!("kanali       unreadable: {error}"),
     }
-    let watcher = match devnotify::find_watcher() {
+    let watcher = match window::find_watcher() {
         None => "not running".to_string(),
-        Some(_) => match devnotify::wait_paused(Duration::ZERO) {
-            Ok(true) => "running, paused".to_string(),
-            Ok(false) => "running, holding".to_string(),
-            Err(_) => "running".to_string(),
+        Some(_) => match window::query_watcher_state() {
+            Some(state) => format!("running: {}", state.label()),
+            None => "running, not answering".to_string(),
         },
     };
     println!("watcher      {watcher}");

@@ -1,45 +1,64 @@
-//! Device arrival and removal notifications, and control requests, through
-//! a message-only window.
+//! The watcher's hidden window: device arrival and removal notifications,
+//! control requests, the notification-area icon with its menu, and the
+//! state other processes can ask about.
 //!
-//! The message loop runs on whichever thread calls [`run_message_loop`] and
-//! forwards events for the display's printer interface, and control
-//! requests posted to the window, to a channel. It also raises an interrupt
-//! flag so a blocking holding loop can notice promptly. Another process
-//! reaches a running watcher through [`control_watcher`], which finds the
-//! window by class name.
+//! The message loop runs on whichever thread calls [`run_message_loop`]
+//! and forwards events for the display's printer interface, control
+//! requests posted to the window, and menu choices to a channel. It also
+//! raises an interrupt flag so a blocking holding loop can notice
+//! promptly. Another process reaches a running watcher through
+//! [`control_watcher`] and [`query_watcher_state`], which find the window
+//! by class name.
 
 use std::ffi::c_void;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::overlapped::wait_millis;
+use crate::tray::{Icon, Menu, TrayIcon};
 use crate::usbprint::{is_panorama_path, wide, WinError};
-use crate::watch::Event;
+use crate::watch::{Event, State};
 use crate::win::*;
 
-/// Window class of the watcher's message-only window.
+/// Window class of the watcher's window.
 pub const WINDOW_CLASS: &str = "ezrama-watch";
 /// Session-local event that is set while the watcher has released the
 /// display on request.
 pub const PAUSED_EVENT_NAME: &str = "Local\\ezrama-paused";
+/// How long a state query waits for a watcher that is not pumping messages.
+const QUERY_TIMEOUT_MS: u32 = 2000;
 
 const WM_STOP_WATCH: u32 = WM_APP + 1;
 const WM_PAUSE_WATCH: u32 = WM_APP + 2;
 const WM_RESUME_WATCH: u32 = WM_APP + 3;
+const WM_OPEN_KANALI: u32 = WM_APP + 4;
+const WM_QUERY_STATE: u32 = WM_APP + 5;
+const WM_STATE_CHANGED: u32 = WM_APP + 6;
+const WM_TRAY: u32 = WM_APP + 7;
+
+const MENU_PAUSE: usize = 1;
+const MENU_RESUME: usize = 2;
+const MENU_OPEN_KANALI: usize = 3;
+const MENU_QUIT: usize = 4;
 
 static SENDER: Mutex<Option<Sender<Event>>> = Mutex::new(None);
 static INTERRUPT: AtomicBool = AtomicBool::new(false);
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
+static STATE: AtomicU8 = AtomicU8::new(State::Starting as u8);
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+static TRAY: Mutex<Option<TrayIcon>> = Mutex::new(None);
+static KANALI_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 /// A request sent to a running watcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Request {
     Pause,
     Resume,
+    OpenKanali,
     Stop,
 }
 
@@ -48,9 +67,19 @@ impl Request {
         match self {
             Request::Pause => WM_PAUSE_WATCH,
             Request::Resume => WM_RESUME_WATCH,
+            Request::OpenKanali => WM_OPEN_KANALI,
             Request::Stop => WM_STOP_WATCH,
         }
     }
+}
+
+/// What the message loop needs from the supervisor before it starts.
+#[derive(Default)]
+pub struct Setup {
+    /// The notification-area icon; none means no icon is shown.
+    pub icon: Option<Icon>,
+    /// Whether the menu may offer to start KANALI.
+    pub kanali_available: bool,
 }
 
 /// Whether an event has arrived since the flag was last cleared.
@@ -72,16 +101,16 @@ fn local_window() -> HWND {
     WINDOW.load(Ordering::SeqCst) as HWND
 }
 
-fn post(window: HWND, request: Request) -> bool {
+fn post(window: HWND, message: u32) -> bool {
     if window.is_null() {
         return false;
     }
-    unsafe { PostMessageW(window, request.message(), 0, 0) != 0 }
+    unsafe { PostMessageW(window, message, 0, 0) != 0 }
 }
 
 /// Sends a request to the message loop running in this process.
 pub fn request(request: Request) -> bool {
-    post(local_window(), request)
+    post(local_window(), request.message())
 }
 
 /// Asks this process's message loop to quit.
@@ -89,12 +118,31 @@ pub fn request_stop() -> bool {
     request(Request::Stop)
 }
 
+/// The state this process's watcher last reported.
+pub fn state() -> State {
+    State::from_code(STATE.load(Ordering::SeqCst)).unwrap_or(State::Starting)
+}
+
+/// Records the watcher's state and refreshes the icon's tooltip.
+pub fn set_state(state: State) {
+    STATE.store(state as u8, Ordering::SeqCst);
+    post(local_window(), WM_STATE_CHANGED);
+}
+
+fn tooltip(state: State) -> String {
+    format!("ezrama: {}", state.label())
+}
+
 /// Finds the window of a watcher running anywhere in this desktop session.
 pub fn find_watcher() -> Option<HWND> {
     let class = wide(WINDOW_CLASS);
-    let window = unsafe {
-        FindWindowExW(HWND_MESSAGE, ptr::null_mut(), class.as_ptr(), ptr::null())
-    };
+    let mut window =
+        unsafe { FindWindowExW(ptr::null_mut(), ptr::null_mut(), class.as_ptr(), ptr::null()) };
+    if window.is_null() {
+        window = unsafe {
+            FindWindowExW(HWND_MESSAGE, ptr::null_mut(), class.as_ptr(), ptr::null())
+        };
+    }
     if window.is_null() {
         None
     } else {
@@ -106,9 +154,35 @@ pub fn find_watcher() -> Option<HWND> {
 /// session. Returns false when there is none.
 pub fn control_watcher(request: Request) -> bool {
     match find_watcher() {
-        Some(window) => post(window, request),
+        Some(window) => post(window, request.message()),
         None => false,
     }
+}
+
+/// Asks the watcher owning `window` for its state.
+fn query_state(window: HWND) -> Option<State> {
+    let mut code: usize = 0;
+    let answered = unsafe {
+        SendMessageTimeoutW(
+            window,
+            WM_QUERY_STATE,
+            0,
+            0,
+            SMTO_ABORTIFHUNG,
+            QUERY_TIMEOUT_MS,
+            &mut code,
+        )
+    };
+    if answered == 0 {
+        return None;
+    }
+    State::from_code(code as u8)
+}
+
+/// The state of whichever watcher is running in this desktop session, if
+/// one is running and answers.
+pub fn query_watcher_state() -> Option<State> {
+    find_watcher().and_then(query_state)
 }
 
 /// The event a watcher sets while it has released the display on request.
@@ -182,7 +256,8 @@ pub fn wait_named(name: &str, timeout: Duration) -> Result<bool, WinError> {
     Ok(waited == WAIT_OBJECT_0)
 }
 
-fn send(event: Event) {
+/// Hands an event to the supervisor and interrupts a holding loop.
+pub fn post_event(event: Event) {
     INTERRUPT.store(true, Ordering::SeqCst);
     if let Ok(sender) = SENDER.lock() {
         if let Some(sender) = sender.as_ref() {
@@ -213,6 +288,45 @@ unsafe fn broadcast_path(lparam: LPARAM) -> Option<String> {
     Some(String::from_utf16_lossy(&units))
 }
 
+/// Builds the menu for the current state, shows it, and acts on the
+/// choice.
+fn show_menu(window: HWND) {
+    let Some(menu) = Menu::new() else {
+        return;
+    };
+    let state = state();
+    menu.item(0, state.label(), false);
+    menu.separator();
+    if state.released() {
+        menu.item(MENU_RESUME, "Resume", true);
+    } else {
+        menu.item(MENU_PAUSE, "Pause", true);
+    }
+    let kanali = KANALI_AVAILABLE.load(Ordering::SeqCst);
+    menu.item(
+        MENU_OPEN_KANALI,
+        if kanali { "Open KANALI" } else { "KANALI is not installed" },
+        kanali && state != State::WaitingForKanali,
+    );
+    menu.separator();
+    menu.item(MENU_QUIT, "Quit", true);
+    match menu.show(window) {
+        Some(MENU_PAUSE) => post_event(Event::Pause),
+        Some(MENU_RESUME) => post_event(Event::Resume),
+        Some(MENU_OPEN_KANALI) => post_event(Event::OpenKanali),
+        Some(MENU_QUIT) => unsafe { PostQuitMessage(0) },
+        _ => {}
+    }
+}
+
+fn with_tray(action: impl FnOnce(&mut TrayIcon)) {
+    if let Ok(mut slot) = TRAY.lock() {
+        if let Some(tray) = slot.as_mut() {
+            action(tray);
+        }
+    }
+}
+
 unsafe extern "system" fn window_procedure(
     window: HWND,
     message: u32,
@@ -225,9 +339,9 @@ unsafe extern "system" fn window_procedure(
                 if let Some(path) = broadcast_path(lparam) {
                     if is_panorama_path(&path) {
                         if wparam == DBT_DEVICEARRIVAL {
-                            send(Event::Arrived(path));
+                            post_event(Event::Arrived(path));
                         } else {
-                            send(Event::Removed(path));
+                            post_event(Event::Removed(path));
                         }
                     }
                 }
@@ -235,11 +349,30 @@ unsafe extern "system" fn window_procedure(
             1
         }
         WM_PAUSE_WATCH => {
-            send(Event::Pause);
+            post_event(Event::Pause);
             0
         }
         WM_RESUME_WATCH => {
-            send(Event::Resume);
+            post_event(Event::Resume);
+            0
+        }
+        WM_OPEN_KANALI => {
+            post_event(Event::OpenKanali);
+            0
+        }
+        WM_QUERY_STATE => STATE.load(Ordering::SeqCst) as LRESULT,
+        WM_STATE_CHANGED => {
+            let tip = tooltip(state());
+            with_tray(|tray| {
+                tray.set_tip(&tip);
+            });
+            0
+        }
+        WM_TRAY => {
+            let event = (lparam & 0xffff) as u32;
+            if matches!(event, WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT) {
+                show_menu(window);
+            }
             0
         }
         WM_STOP_WATCH | WM_CLOSE => {
@@ -254,17 +387,28 @@ unsafe extern "system" fn window_procedure(
             0
         }
         WM_DESTROY => 0,
-        _ => DefWindowProcW(window, message, wparam, lparam),
+        _ => {
+            let taskbar_created = TASKBAR_CREATED.load(Ordering::SeqCst);
+            if taskbar_created != 0 && message == taskbar_created {
+                with_tray(|tray| {
+                    tray.show();
+                });
+                return 0;
+            }
+            DefWindowProcW(window, message, wparam, lparam)
+        }
     }
 }
 
-/// Creates the message-only window, registers for printer-interface
-/// notifications, and pumps messages until asked to quit. Sends
-/// [`Event::Quit`] on the channel before returning.
-pub fn run_message_loop(sender: Sender<Event>) -> Result<(), WinError> {
+/// Creates the hidden window, registers for printer-interface
+/// notifications, shows the icon when `setup` has one, and pumps messages
+/// until asked to quit. Sends [`Event::Quit`] on the channel before
+/// returning.
+pub fn run_message_loop(sender: Sender<Event>, setup: Setup) -> Result<(), WinError> {
     if let Ok(mut slot) = SENDER.lock() {
         *slot = Some(sender.clone());
     }
+    KANALI_AVAILABLE.store(setup.kanali_available, Ordering::SeqCst);
 
     let class_name = wide(WINDOW_CLASS);
     let instance = unsafe { GetModuleHandleW(ptr::null()) };
@@ -297,7 +441,7 @@ pub fn run_message_loop(sender: Sender<Event>) -> Result<(), WinError> {
             0,
             0,
             0,
-            HWND_MESSAGE,
+            ptr::null_mut(),
             ptr::null_mut(),
             instance,
             ptr::null_mut(),
@@ -329,6 +473,19 @@ pub fn run_message_loop(sender: Sender<Event>) -> Result<(), WinError> {
         return Err(error);
     }
 
+    let taskbar_created = wide("TaskbarCreated");
+    TASKBAR_CREATED.store(
+        unsafe { RegisterWindowMessageW(taskbar_created.as_ptr()) },
+        Ordering::SeqCst,
+    );
+    if let Some(icon) = &setup.icon {
+        let mut tray = TrayIcon::new(window, WM_TRAY, icon.handle(), &tooltip(state()));
+        tray.show();
+        if let Ok(mut slot) = TRAY.lock() {
+            *slot = Some(tray);
+        }
+    }
+
     let mut message = MSG {
         hwnd: ptr::null_mut(),
         message: 0,
@@ -348,12 +505,16 @@ pub fn run_message_loop(sender: Sender<Event>) -> Result<(), WinError> {
         }
     }
 
+    if let Ok(mut slot) = TRAY.lock() {
+        *slot = None;
+    }
     unsafe {
         UnregisterDeviceNotification(registration);
         DestroyWindow(window);
     }
     WINDOW.store(0, Ordering::SeqCst);
-    send(Event::Quit);
+    drop(setup);
+    post_event(Event::Quit);
     if let Ok(mut slot) = SENDER.lock() {
         *slot = None;
     }
@@ -421,30 +582,45 @@ mod tests {
     }
 
     #[test]
-    fn message_loop_delivers_control_requests_in_order() {
+    fn message_loop_delivers_control_requests_and_answers_state_queries() {
         let _guard = LOCK.lock().unwrap();
         assert!(!request_stop());
 
         let (sender, events) = mpsc::channel();
-        let pump = thread::spawn(move || run_message_loop(sender));
+        let pump = thread::spawn(move || run_message_loop(sender, Setup::default()));
         let deadline = Instant::now() + Duration::from_secs(5);
         while local_window().is_null() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(!local_window().is_null(), "the message loop did not create its window");
 
+        set_state(State::Connecting);
+        assert_eq!(query_state(local_window()), Some(State::Connecting));
+        set_state(State::Active);
+        assert_eq!(query_state(local_window()), Some(State::Active));
+        assert_eq!(state(), State::Active);
+
         clear_interrupt();
         assert!(request(Request::Pause));
         assert!(request(Request::Resume));
+        assert!(request(Request::OpenKanali));
         assert!(request_stop());
         let wait = Duration::from_secs(5);
         assert_eq!(events.recv_timeout(wait), Ok(Event::Pause));
         assert_eq!(events.recv_timeout(wait), Ok(Event::Resume));
+        assert_eq!(events.recv_timeout(wait), Ok(Event::OpenKanali));
         assert_eq!(events.recv_timeout(wait), Ok(Event::Quit));
         assert!(interrupted());
         pump.join().unwrap().unwrap();
         assert!(local_window().is_null());
         assert!(!request_stop());
+        assert_eq!(query_state(ptr::null_mut()), None);
+    }
+
+    #[test]
+    fn tooltips_carry_the_state_label() {
+        assert_eq!(tooltip(State::Active), "ezrama: Active");
+        assert_eq!(tooltip(State::WaitingForKanali), "ezrama: Waiting for KANALI");
     }
 
     #[test]

@@ -35,10 +35,10 @@ pub struct RunEntry {
     pub command: String,
 }
 
-fn open_run_key(access: DWORD) -> Result<HKEY, WinError> {
-    let subkey = wide(RUN_KEY);
+fn open_key(root: HKEY, subkey: &str, access: DWORD) -> Result<HKEY, WinError> {
+    let subkey = wide(subkey);
     let mut key: HKEY = ptr::null_mut();
-    let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, access, &mut key) };
+    let status = unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, access, &mut key) };
     if status != ERROR_SUCCESS {
         return Err(WinError {
             call: "RegOpenKeyExW",
@@ -46,6 +46,10 @@ fn open_run_key(access: DWORD) -> Result<HKEY, WinError> {
         });
     }
     Ok(key)
+}
+
+fn open_run_key(access: DWORD) -> Result<HKEY, WinError> {
+    open_key(HKEY_CURRENT_USER, RUN_KEY, access)
 }
 
 fn utf16_string(bytes: &[u8]) -> String {
@@ -109,7 +113,17 @@ pub fn startup_disabled(name: &str) -> Result<bool, WinError> {
 
 /// Reads the string value `name` under the Run key, if it exists.
 pub fn read_run_value(name: &str) -> Result<Option<String>, WinError> {
-    let key = open_run_key(KEY_QUERY_VALUE)?;
+    read_string(HKEY_CURRENT_USER, RUN_KEY, name)
+}
+
+/// Reads the string value `name` under `subkey` of `root`. A missing key
+/// or value is `None`.
+pub fn read_string(root: HKEY, subkey: &str, name: &str) -> Result<Option<String>, WinError> {
+    let key = match open_key(root, subkey, KEY_QUERY_VALUE) {
+        Ok(key) => key,
+        Err(error) if error.code == ERROR_FILE_NOT_FOUND => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let value_name = wide(name);
     let mut kind: DWORD = 0;
     let mut size: DWORD = 0;
@@ -296,6 +310,12 @@ mod tests {
         bytes.extend_from_slice(&[0, 0, b'z', 0]);
         assert_eq!(utf16_string(&bytes), "ab");
         assert_eq!(utf16_string(&[]), "");
+    }
+
+    #[test]
+    fn a_missing_key_reads_as_no_value() {
+        let value = read_string(HKEY_CURRENT_USER, r"Software\ezrama-no-such-key", "x");
+        assert_eq!(value, Ok(None));
     }
 
     #[test]
