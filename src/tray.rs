@@ -6,13 +6,12 @@
 use std::ffi::c_void;
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::ptr;
 use std::thread;
 use std::time::Duration;
 
 use crate::icon::Image;
-use crate::install::read_string;
+use crate::install::{read_string, start_detached, Process};
 use crate::usbprint::{wide, WinError};
 use crate::win::*;
 
@@ -371,17 +370,9 @@ pub fn kanali_path() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-/// Starts the program at `path` in its own directory with no console.
-pub fn launch(path: &Path) -> std::io::Result<Child> {
-    let mut command = Command::new(path);
-    if let Some(directory) = path.parent() {
-        command.current_dir(directory);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+/// Starts the program at `path` in its own directory.
+pub fn launch(path: &Path) -> Result<Process, WinError> {
+    start_detached(path, "", path.parent())
 }
 
 /// Process ids whose executable is named `name`, other than this process.

@@ -671,10 +671,10 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
     /// process to exit before reporting back.
     fn launch_kanali(path: &Path, log: &mut Logger) -> bool {
         match tray::launch(path) {
-            Ok(mut child) => {
-                log.log(&format!("started KANALI (process {})", child.id()));
+            Ok(process) => {
+                log.log(&format!("started KANALI (process {})", process.id()));
                 thread::spawn(move || {
-                    let _ = child.wait();
+                    process.wait();
                     tray::wait_for_processes_named(tray::KANALI_EXE);
                     window::post_event(Event::KanaliClosed);
                 });
@@ -928,19 +928,8 @@ fn stop_watcher_and_wait() -> bool {
 
 /// Starts the windowless watcher at `watcher`, detached from this process.
 #[cfg(windows)]
-fn spawn_watcher(watcher: &std::path::Path) -> std::io::Result<u32> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    let child = Command::new(watcher)
-        .arg("watch")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(DETACHED_PROCESS)
-        .spawn()?;
-    Ok(child.id())
+fn spawn_watcher(watcher: &std::path::Path) -> Result<u32, crate::usbprint::WinError> {
+    crate::install::start_detached(watcher, "watch", None).map(|process| process.id())
 }
 
 /// Copies the binaries next to the log, registers the logon entry, and

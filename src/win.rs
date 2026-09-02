@@ -528,3 +528,51 @@ extern "system" {
     pub fn WaitForMultipleObjects(nCount: DWORD, lpHandles: *const HANDLE, bWaitAll: BOOL, dwMilliseconds: DWORD) -> DWORD;
     pub fn GetCurrentProcessId() -> DWORD;
 }
+
+pub const DETACHED_PROCESS: DWORD = 0x0000_0008;
+
+#[repr(C)]
+pub struct STARTUPINFOW {
+    pub cb: DWORD,
+    pub lpReserved: *mut u16,
+    pub lpDesktop: *mut u16,
+    pub lpTitle: *mut u16,
+    pub dwX: DWORD,
+    pub dwY: DWORD,
+    pub dwXSize: DWORD,
+    pub dwYSize: DWORD,
+    pub dwXCountChars: DWORD,
+    pub dwYCountChars: DWORD,
+    pub dwFillAttribute: DWORD,
+    pub dwFlags: DWORD,
+    pub wShowWindow: u16,
+    pub cbReserved2: u16,
+    pub lpReserved2: *mut u8,
+    pub hStdInput: HANDLE,
+    pub hStdOutput: HANDLE,
+    pub hStdError: HANDLE,
+}
+
+#[repr(C)]
+pub struct PROCESS_INFORMATION {
+    pub hProcess: HANDLE,
+    pub hThread: HANDLE,
+    pub dwProcessId: DWORD,
+    pub dwThreadId: DWORD,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    pub fn CreateProcessW(
+        lpApplicationName: *const u16,
+        lpCommandLine: *mut u16,
+        lpProcessAttributes: *mut c_void,
+        lpThreadAttributes: *mut c_void,
+        bInheritHandles: BOOL,
+        dwCreationFlags: DWORD,
+        lpEnvironment: *mut c_void,
+        lpCurrentDirectory: *const u16,
+        lpStartupInfo: *const STARTUPINFOW,
+        lpProcessInformation: *mut PROCESS_INFORMATION,
+    ) -> BOOL;
+}
