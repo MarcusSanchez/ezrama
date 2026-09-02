@@ -1,8 +1,12 @@
-//! Device arrival and removal notifications through a message-only window.
+//! Device arrival and removal notifications, and control requests, through
+//! a message-only window.
 //!
 //! The message loop runs on whichever thread calls [`run_message_loop`] and
-//! forwards events for the display's printer interface to a channel. It also
-//! raises an interrupt flag so a blocking holding loop can notice promptly.
+//! forwards events for the display's printer interface, and control
+//! requests posted to the window, to a channel. It also raises an interrupt
+//! flag so a blocking holding loop can notice promptly. Another process
+//! reaches a running watcher through [`control_watcher`], which finds the
+//! window by class name.
 
 use std::ffi::c_void;
 use std::mem;
@@ -10,17 +14,44 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
+use std::time::Duration;
 
+use crate::overlapped::wait_millis;
 use crate::usbprint::{is_panorama_path, wide, WinError};
 use crate::watch::Event;
 use crate::win::*;
 
-/// Private message that asks the loop to quit.
+/// Window class of the watcher's message-only window.
+pub const WINDOW_CLASS: &str = "ezrama-watch";
+/// Session-local event that is set while the watcher has released the
+/// display on request.
+pub const PAUSED_EVENT_NAME: &str = "Local\\ezrama-paused";
+
 const WM_STOP_WATCH: u32 = WM_APP + 1;
+const WM_PAUSE_WATCH: u32 = WM_APP + 2;
+const WM_RESUME_WATCH: u32 = WM_APP + 3;
 
 static SENDER: Mutex<Option<Sender<Event>>> = Mutex::new(None);
 static INTERRUPT: AtomicBool = AtomicBool::new(false);
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+/// A request sent to a running watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    Pause,
+    Resume,
+    Stop,
+}
+
+impl Request {
+    fn message(self) -> u32 {
+        match self {
+            Request::Pause => WM_PAUSE_WATCH,
+            Request::Resume => WM_RESUME_WATCH,
+            Request::Stop => WM_STOP_WATCH,
+        }
+    }
+}
 
 /// Whether an event has arrived since the flag was last cleared.
 pub fn interrupted() -> bool {
@@ -37,13 +68,118 @@ pub fn interrupt() {
     INTERRUPT.store(true, Ordering::SeqCst);
 }
 
-/// Asks a running message loop to quit. Safe to call from any thread.
-pub fn request_stop() -> bool {
-    let window = WINDOW.load(Ordering::SeqCst) as HWND;
+fn local_window() -> HWND {
+    WINDOW.load(Ordering::SeqCst) as HWND
+}
+
+fn post(window: HWND, request: Request) -> bool {
     if window.is_null() {
         return false;
     }
-    unsafe { PostMessageW(window, WM_STOP_WATCH, 0, 0) != 0 }
+    unsafe { PostMessageW(window, request.message(), 0, 0) != 0 }
+}
+
+/// Sends a request to the message loop running in this process.
+pub fn request(request: Request) -> bool {
+    post(local_window(), request)
+}
+
+/// Asks this process's message loop to quit.
+pub fn request_stop() -> bool {
+    request(Request::Stop)
+}
+
+/// Finds the window of a watcher running anywhere in this desktop session.
+pub fn find_watcher() -> Option<HWND> {
+    let class = wide(WINDOW_CLASS);
+    let window = unsafe {
+        FindWindowExW(HWND_MESSAGE, ptr::null_mut(), class.as_ptr(), ptr::null())
+    };
+    if window.is_null() {
+        None
+    } else {
+        Some(window)
+    }
+}
+
+/// Sends a request to whichever watcher is running in this desktop
+/// session. Returns false when there is none.
+pub fn control_watcher(request: Request) -> bool {
+    match find_watcher() {
+        Some(window) => post(window, request),
+        None => false,
+    }
+}
+
+/// The event a watcher sets while it has released the display on request.
+pub struct PausedSignal {
+    handle: HANDLE,
+}
+
+// Event handles may be used from any thread.
+unsafe impl Send for PausedSignal {}
+
+impl PausedSignal {
+    /// Creates or opens the watcher's confirmation event, initially clear.
+    pub fn create() -> Result<Self, WinError> {
+        Self::named(PAUSED_EVENT_NAME)
+    }
+
+    /// Creates or opens an event by name, initially clear.
+    pub fn named(name: &str) -> Result<Self, WinError> {
+        let name = wide(name);
+        let handle = unsafe { CreateEventW(ptr::null_mut(), 1, 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(WinError::last("CreateEventW"));
+        }
+        let signal = Self { handle };
+        signal.clear();
+        Ok(signal)
+    }
+
+    /// Marks the display as released.
+    pub fn set(&self) {
+        unsafe {
+            SetEvent(self.handle);
+        }
+    }
+
+    /// Marks the display as held or about to be.
+    pub fn clear(&self) {
+        unsafe {
+            ResetEvent(self.handle);
+        }
+    }
+}
+
+impl Drop for PausedSignal {
+    fn drop(&mut self) {
+        self.clear();
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Waits up to `timeout` for a watcher to confirm it has released the
+/// display. `Ok(false)` is a timeout; an error means no watcher has created
+/// the confirmation event.
+pub fn wait_paused(timeout: Duration) -> Result<bool, WinError> {
+    wait_named(PAUSED_EVENT_NAME, timeout)
+}
+
+/// Waits up to `timeout` for the named event to be set.
+pub fn wait_named(name: &str, timeout: Duration) -> Result<bool, WinError> {
+    let name = wide(name);
+    let handle = unsafe { OpenEventW(SYNCHRONIZE, 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(WinError::last("OpenEventW"));
+    }
+    let waited = unsafe { WaitForSingleObject(handle, wait_millis(timeout)) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    Ok(waited == WAIT_OBJECT_0)
 }
 
 fn send(event: Event) {
@@ -98,6 +234,14 @@ unsafe extern "system" fn window_procedure(
             }
             1
         }
+        WM_PAUSE_WATCH => {
+            send(Event::Pause);
+            0
+        }
+        WM_RESUME_WATCH => {
+            send(Event::Resume);
+            0
+        }
         WM_STOP_WATCH | WM_CLOSE => {
             PostQuitMessage(0);
             0
@@ -122,7 +266,7 @@ pub fn run_message_loop(sender: Sender<Event>) -> Result<(), WinError> {
         *slot = Some(sender.clone());
     }
 
-    let class_name = wide("ezrama-watch");
+    let class_name = wide(WINDOW_CLASS);
     let instance = unsafe { GetModuleHandleW(ptr::null()) };
     let class = WNDCLASSW {
         style: 0,
@@ -138,7 +282,6 @@ pub fn run_message_loop(sender: Sender<Event>) -> Result<(), WinError> {
     };
     if unsafe { RegisterClassW(&class) } == 0 {
         let error = WinError::last("RegisterClassW");
-        // A second loop in the same process finds the class already registered.
         if error.code != 1410 {
             return Err(error);
         }
@@ -220,6 +363,12 @@ pub fn run_message_loop(sender: Sender<Event>) -> Result<(), WinError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+
+    /// Serialises the tests that touch the process-wide statics.
+    static LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn broadcast_filter_layout() {
@@ -262,6 +411,7 @@ mod tests {
 
     #[test]
     fn interrupt_flag_round_trips() {
+        let _guard = LOCK.lock().unwrap();
         clear_interrupt();
         assert!(!interrupted());
         interrupt();
@@ -271,7 +421,44 @@ mod tests {
     }
 
     #[test]
-    fn stop_without_a_loop_is_refused() {
+    fn message_loop_delivers_control_requests_in_order() {
+        let _guard = LOCK.lock().unwrap();
         assert!(!request_stop());
+
+        let (sender, events) = mpsc::channel();
+        let pump = thread::spawn(move || run_message_loop(sender));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while local_window().is_null() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!local_window().is_null(), "the message loop did not create its window");
+
+        clear_interrupt();
+        assert!(request(Request::Pause));
+        assert!(request(Request::Resume));
+        assert!(request_stop());
+        let wait = Duration::from_secs(5);
+        assert_eq!(events.recv_timeout(wait), Ok(Event::Pause));
+        assert_eq!(events.recv_timeout(wait), Ok(Event::Resume));
+        assert_eq!(events.recv_timeout(wait), Ok(Event::Quit));
+        assert!(interrupted());
+        pump.join().unwrap().unwrap();
+        assert!(local_window().is_null());
+        assert!(!request_stop());
+    }
+
+    #[test]
+    fn paused_signal_round_trips_through_a_named_event() {
+        let name = format!("Local\\ezrama-paused-test-{}", std::process::id());
+        let short = Duration::from_millis(50);
+        assert!(wait_named(&name, short).is_err());
+        let signal = PausedSignal::named(&name).unwrap();
+        assert_eq!(wait_named(&name, short), Ok(false));
+        signal.set();
+        assert_eq!(wait_named(&name, short), Ok(true));
+        signal.clear();
+        assert_eq!(wait_named(&name, short), Ok(false));
+        drop(signal);
+        assert!(wait_named(&name, short).is_err());
     }
 }

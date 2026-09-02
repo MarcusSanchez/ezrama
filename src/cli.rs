@@ -15,6 +15,9 @@ Commands:
   activate   Start a session and switch the panel to its stored media once
   run        Start a session and hold it with keepalive pings until Ctrl+C
   watch      Hold a session whenever the panel is present; made for autostart
+  pause      Ask the running watcher to release the panel and wait for it
+  resume     Ask the running watcher to take the panel back
+  stop       Ask the running watcher to exit
   help       Show this message
   version    Print the version
 
@@ -29,6 +32,16 @@ Options:
 const EXIT_BUSY: u8 = 4;
 /// Exit code when more than one display is present.
 const EXIT_SEVERAL: u8 = 3;
+/// How long `pause` waits for the watcher to confirm the release.
+const PAUSE_CONFIRMATION: Duration = Duration::from_secs(5);
+
+/// A request for a running watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatcherRequest {
+    Pause,
+    Resume,
+    Stop,
+}
 
 /// Runs the command line given by the process arguments.
 pub fn main() -> ExitCode {
@@ -59,6 +72,9 @@ fn dispatch(args: &[String]) -> ExitCode {
             Ok(interval) => watch(verbose, interval),
             Err(message) => usage_error(&message),
         },
+        Some("pause") => control(WatcherRequest::Pause),
+        Some("resume") => control(WatcherRequest::Resume),
+        Some("stop") => control(WatcherRequest::Stop),
         Some("version") => {
             println!("{NAME} {VERSION}");
             ExitCode::SUCCESS
@@ -542,7 +558,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
     use crate::hold::{hold, HoldEvent, KEEPALIVE_WRITE_RETRIES};
     use crate::log::{default_log_path, Logger};
     use crate::usbprint::{self, Device, Discovery};
-    use crate::watch::{Event, Reconnect};
+    use crate::watch::{Control, Directive, Event, Reconnect};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::thread;
 
@@ -557,75 +573,109 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
     if !stop_signal::install() {
         log.log("console stop handler unavailable");
     }
+    let paused_signal = match devnotify::PausedSignal::create() {
+        Ok(signal) => Some(signal),
+        Err(error) => {
+            log.log(&format!("pause confirmation unavailable: {error}"));
+            None
+        }
+    };
 
     let (sender, events) = mpsc::channel::<Event>();
     let pump = thread::spawn(move || devnotify::run_message_loop(sender));
 
-    /// Handles queued events without waiting. Returns true on quit.
-    fn drain(events: &Receiver<Event>, log: &mut Logger) -> bool {
-        while let Ok(event) = events.try_recv() {
-            match event {
-                Event::Quit => return true,
-                Event::Arrived(path) => log.log(&format!("panel arrived: {path}")),
-                Event::Removed(path) => log.log(&format!("panel removed: {path}")),
-            }
+    /// Applies one event to the control state and logs it.
+    fn apply(event: Event, control: &mut Control, log: &mut Logger) -> Directive {
+        match &event {
+            Event::Arrived(path) => log.log(&format!("panel arrived: {path}")),
+            Event::Removed(path) => log.log(&format!("panel removed: {path}")),
+            Event::Pause => log.log("pause requested"),
+            Event::Resume => log.log("resume requested"),
+            Event::Quit => log.log("stop requested"),
         }
-        false
+        control.apply(&event)
     }
 
-    /// Waits for one event, or for `timeout` when given. Returns true on
-    /// quit, including when the notification loop has gone away.
-    fn wait(events: &Receiver<Event>, timeout: Option<Duration>, log: &mut Logger) -> bool {
+    /// Handles queued events without waiting.
+    fn drain(events: &Receiver<Event>, control: &mut Control, log: &mut Logger) -> Directive {
+        while let Ok(event) = events.try_recv() {
+            if apply(event, control, log) == Directive::Quit {
+                return Directive::Quit;
+            }
+        }
+        Directive::Continue
+    }
+
+    /// Waits for one event, or for `timeout` when given. A vanished
+    /// notification loop counts as a quit.
+    fn wait(
+        events: &Receiver<Event>,
+        timeout: Option<Duration>,
+        control: &mut Control,
+        log: &mut Logger,
+    ) -> Directive {
         let event = match timeout {
             None => match events.recv() {
                 Ok(event) => event,
-                Err(_) => return true,
+                Err(_) => return Directive::Quit,
             },
             Some(timeout) => match events.recv_timeout(timeout) {
                 Ok(event) => event,
-                Err(RecvTimeoutError::Timeout) => return false,
-                Err(RecvTimeoutError::Disconnected) => return true,
+                Err(RecvTimeoutError::Timeout) => return Directive::Continue,
+                Err(RecvTimeoutError::Disconnected) => return Directive::Quit,
             },
         };
-        match event {
-            Event::Quit => true,
-            Event::Arrived(path) => {
-                log.log(&format!("panel arrived: {path}"));
-                false
-            }
-            Event::Removed(path) => {
-                log.log(&format!("panel removed: {path}"));
-                false
-            }
-        }
+        apply(event, control, log)
     }
 
     let mut reconnect = Reconnect::new();
+    let mut control = Control::new();
+    let mut announced_pause = false;
     loop {
-        if stop_signal::requested() || drain(&events, &mut log) {
+        if stop_signal::requested() || drain(&events, &mut control, &mut log) == Directive::Quit {
             break;
         }
         devnotify::clear_interrupt();
+
+        if control.paused() {
+            if let Some(signal) = &paused_signal {
+                signal.set();
+            }
+            if !announced_pause {
+                log.log("paused: the panel is released until resume");
+                announced_pause = true;
+            }
+            if wait(&events, None, &mut control, &mut log) == Directive::Quit {
+                break;
+            }
+            continue;
+        }
+        if let Some(signal) = &paused_signal {
+            signal.clear();
+        }
+        announced_pause = false;
 
         let path = match usbprint::find_panorama() {
             Ok(Discovery::One(path)) => path,
             Ok(Discovery::Absent) => {
                 log.log("panel not present; waiting");
-                if wait(&events, None, &mut log) {
+                if wait(&events, None, &mut control, &mut log) == Directive::Quit {
                     break;
                 }
                 continue;
             }
             Ok(Discovery::Several(paths)) => {
                 log.log(&format!("{} panels present; waiting for exactly one", paths.len()));
-                if wait(&events, None, &mut log) {
+                if wait(&events, None, &mut control, &mut log) == Directive::Quit {
                     break;
                 }
                 continue;
             }
             Err(error) => {
                 log.log(&format!("discovery failed: {error}"));
-                if wait(&events, Some(reconnect.next_delay()), &mut log) {
+                if wait(&events, Some(reconnect.next_delay()), &mut control, &mut log)
+                    == Directive::Quit
+                {
                     break;
                 }
                 continue;
@@ -640,7 +690,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
             Err(message) => {
                 let delay = reconnect.next_delay();
                 log.log(&format!("{message}; retrying in {} s", delay.as_secs()));
-                if wait(&events, Some(delay), &mut log) {
+                if wait(&events, Some(delay), &mut control, &mut log) == Directive::Quit {
                     break;
                 }
                 continue;
@@ -678,7 +728,7 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
                     "session lost after {pings} pings: {error}; retrying in {} s",
                     delay.as_secs()
                 ));
-                if wait(&events, Some(delay), &mut log) {
+                if wait(&events, Some(delay), &mut control, &mut log) == Directive::Quit {
                     break;
                 }
             }
@@ -693,6 +743,50 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
         Err(_) => log.log("device notification thread failed"),
     }
     ExitCode::SUCCESS
+}
+
+/// Sends a request to the watcher running in this desktop session. For a
+/// pause, waits for the watcher to confirm it has released the panel.
+#[cfg(windows)]
+fn control(request: WatcherRequest) -> ExitCode {
+    use crate::devnotify::{self, Request};
+
+    let sent = match request {
+        WatcherRequest::Pause => devnotify::control_watcher(Request::Pause),
+        WatcherRequest::Resume => devnotify::control_watcher(Request::Resume),
+        WatcherRequest::Stop => devnotify::control_watcher(Request::Stop),
+    };
+    if !sent {
+        eprintln!("no ezrama watcher is running");
+        return ExitCode::from(1);
+    }
+    match request {
+        WatcherRequest::Pause => match devnotify::wait_paused(PAUSE_CONFIRMATION) {
+            Ok(true) => {
+                println!("watcher paused; the panel is released");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                eprintln!(
+                    "watcher did not confirm the pause within {} s",
+                    PAUSE_CONFIRMATION.as_secs()
+                );
+                ExitCode::from(1)
+            }
+            Err(error) => {
+                eprintln!("pause requested, but there is no confirmation to wait for: {error}");
+                ExitCode::from(1)
+            }
+        },
+        WatcherRequest::Resume => {
+            println!("watcher resumed");
+            ExitCode::SUCCESS
+        }
+        WatcherRequest::Stop => {
+            println!("watcher asked to stop");
+            ExitCode::SUCCESS
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -718,6 +812,11 @@ fn run(_verbose: bool, _interval: Duration) -> ExitCode {
 #[cfg(not(windows))]
 fn watch(_verbose: bool, _interval: Duration) -> ExitCode {
     unsupported("watch")
+}
+
+#[cfg(not(windows))]
+fn control(_request: WatcherRequest) -> ExitCode {
+    unsupported("watcher control")
 }
 
 #[cfg(not(windows))]

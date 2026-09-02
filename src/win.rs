@@ -60,6 +60,10 @@ pub const DBT_DEVICEREMOVECOMPLETE: WPARAM = 0x8004;
 pub const DBT_DEVTYP_DEVICEINTERFACE: DWORD = 5;
 pub const DEVICE_NOTIFY_WINDOW_HANDLE: DWORD = 0;
 
+pub const EVENT_MODIFY_STATE: DWORD = 0x0002;
+pub const SYNCHRONIZE: DWORD = 0x0010_0000;
+pub const ERROR_ALREADY_EXISTS: DWORD = 183;
+
 #[repr(C)]
 pub struct WNDCLASSW {
     pub style: u32,
@@ -150,6 +154,12 @@ extern "system" {
         Flags: DWORD,
     ) -> HANDLE;
     pub fn UnregisterDeviceNotification(Handle: HANDLE) -> BOOL;
+    pub fn FindWindowExW(
+        hWndParent: HWND,
+        hWndChildAfter: HWND,
+        lpszClass: *const u16,
+        lpszWindow: *const u16,
+    ) -> HWND;
 }
 
 pub const DIGCF_PRESENT: DWORD = 0x0000_0002;
@@ -282,4 +292,7 @@ extern "system" {
     pub fn SetConsoleCtrlHandler(HandlerRoutine: PHANDLER_ROUTINE, Add: BOOL) -> BOOL;
     pub fn GetModuleHandleW(lpModuleName: *const u16) -> HANDLE;
     pub fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
+    pub fn OpenEventW(dwDesiredAccess: DWORD, bInheritHandle: BOOL, lpName: *const u16) -> HANDLE;
+    pub fn SetEvent(hEvent: HANDLE) -> BOOL;
+    pub fn ResetEvent(hEvent: HANDLE) -> BOOL;
 }
