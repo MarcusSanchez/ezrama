@@ -21,8 +21,10 @@ use crate::wire::{self, field, DeviceInformation, ProtocolError, Response, UserC
 pub const MAX_SKIPPED_FRAMES: usize = 256;
 /// Bytes of unrelated complete frames tolerated while waiting for a match.
 pub const MAX_SKIPPED_BYTES: usize = 4 * 1024 * 1024;
-/// How long a drain waits for stragglers.
+/// Bound on a drain sweep, and how long to wait for one optional reply.
 pub const DRAIN_WINDOW: Duration = Duration::from_millis(250);
+/// How long a keepalive Ping may take to transfer.
+pub const KEEPALIVE_WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
 /// How long a matching response may take.
 pub const TRANSACTION_TIMEOUT: Duration = Duration::from_millis(3000);
 /// How long a bootstrap request may take to transfer.
@@ -139,6 +141,29 @@ impl SkipBudget {
         self.bytes += payload_len + frame::HEADER_LEN;
         self.frames <= MAX_SKIPPED_FRAMES && self.bytes <= MAX_SKIPPED_BYTES
     }
+}
+
+/// What arrived after a write-only request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionalReply {
+    /// Nothing arrived within the window.
+    None,
+    /// The device acknowledged the request by track id.
+    Acknowledged,
+    /// An unrelated frame arrived and was consumed.
+    Drained,
+}
+
+/// How a keepalive Ping ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeepaliveOutcome {
+    /// The Ping transferred; the reply, if any, was consumed.
+    Sent(OptionalReply),
+    /// The write transferred nothing before its deadline; the session is
+    /// still open and the Ping may be sent again.
+    Retryable(SessionError),
+    /// The session has been closed.
+    Fatal(SessionError),
 }
 
 /// What the bootstrap learned.
@@ -279,23 +304,130 @@ impl<T: Transport> Session<T> {
         }
     }
 
-    /// Collects every complete frame that arrives within `window` and then
-    /// discards any partial frame left over, so a later exchange starts
-    /// from a clean stream. The skip budget bounds how much may be drained.
-    pub fn drain(&mut self, window: Duration) -> Result<Vec<Vec<u8>>, SessionError> {
+    /// Sweeps up every complete frame the device has already sent, without
+    /// waiting for more, then discards any partial frame left over so the
+    /// next exchange starts from a clean stream. Bounded by the skip budget
+    /// and by [`DRAIN_WINDOW`] of processing time.
+    pub fn drain_queued(&mut self) -> Result<Vec<Vec<u8>>, SessionError> {
         self.ensure_open()?;
-        let deadline = self.clock.now() + window;
+        let started = self.clock.now();
         let mut discarded = 0;
         let mut budget = SkipBudget::default();
         let mut drained = Vec::new();
-        while let Some(payload) = self.read_frame(deadline, &mut discarded)? {
-            if !budget.skip(payload.len()) {
-                return Err(self.close(SessionError::TooManySkipped));
+        loop {
+            loop {
+                match self.decoder.resync_and_take_frame(&mut discarded) {
+                    Ok(Some(payload)) => {
+                        if !budget.skip(payload.len()) {
+                            return Err(self.close(SessionError::TooManySkipped));
+                        }
+                        drained.push(payload);
+                    }
+                    Ok(None) => break,
+                    Err(error) => return Err(self.close(SessionError::Frame(error))),
+                }
             }
-            drained.push(payload);
+            if self.clock.now().saturating_duration_since(started) >= DRAIN_WINDOW {
+                break;
+            }
+            let bytes = match self.transport.read(Duration::ZERO) {
+                Ok(bytes) => bytes,
+                Err(error) => return Err(self.close(SessionError::Read(error))),
+            };
+            if bytes.is_empty() {
+                break;
+            }
+            self.decoder.push(&bytes);
         }
         self.decoder.clear();
         Ok(drained)
+    }
+
+    /// Waits up to [`DRAIN_WINDOW`] for at most one frame after a
+    /// write-only request. A frame for `track` without an error is an
+    /// acknowledgement; any frame carrying a device error is a rejection,
+    /// returned without closing; any other frame is consumed. A partial
+    /// frame left at the deadline is discarded.
+    pub fn await_optional_reply(
+        &mut self,
+        track: Option<NonZeroU64>,
+    ) -> Result<OptionalReply, SessionError> {
+        self.ensure_open()?;
+        let deadline = self.clock.now() + DRAIN_WINDOW;
+        let mut discarded = 0;
+        let Some(payload) = self.read_frame(deadline, &mut discarded)? else {
+            self.decoder.clear();
+            return Ok(OptionalReply::None);
+        };
+        if let Ok(response) = Response::parse(&payload) {
+            if let Some(rejection) = response.rejection() {
+                return Err(SessionError::Rejected(rejection.clone()));
+            }
+            let matches = track.is_some_and(|track| {
+                matches!(
+                    response.header,
+                    Some(header) if header.version == 1 && header.track_id == track.get()
+                )
+            });
+            if matches {
+                return Ok(OptionalReply::Acknowledged);
+            }
+        }
+        Ok(OptionalReply::Drained)
+    }
+
+    /// Writes a tracked request whose reply is optional: drain, write, then
+    /// wait for at most one reply. A write failure closes the session; a
+    /// rejection is returned without closing.
+    pub fn write_tracked_only(
+        &mut self,
+        request: impl FnOnce(NonZeroU64) -> Vec<u8>,
+    ) -> Result<OptionalReply, SessionError> {
+        self.ensure_open()?;
+        let track = self.allocate_track();
+        let frame = framed(&request(track))?;
+        self.drain_queued()?;
+        if let Err(error) = self.write_bytes(&frame, TRANSACTION_TIMEOUT) {
+            return Err(self.close(error));
+        }
+        self.await_optional_reply(Some(track))
+    }
+
+    /// Sends the empty overlay layout that switches the panel to its stored
+    /// work configuration. Any failure, including a rejection, closes the
+    /// session.
+    pub fn activate(&mut self) -> Result<OptionalReply, SessionError> {
+        match self.write_tracked_only(wire::activation_trigger) {
+            Ok(reply) => Ok(reply),
+            Err(error) => Err(self.close(error)),
+        }
+    }
+
+    /// Sends one keepalive Ping. The session stays open after a Ping write
+    /// that timed out with nothing transferred; every other failure closes
+    /// it.
+    pub fn ping(&mut self) -> KeepaliveOutcome {
+        if let Err(error) = self.ensure_open() {
+            return KeepaliveOutcome::Fatal(error);
+        }
+        if let Err(error) = self.drain_queued() {
+            return KeepaliveOutcome::Fatal(error);
+        }
+        let frame = match framed(&wire::keepalive_ping()) {
+            Ok(frame) => frame,
+            Err(error) => return KeepaliveOutcome::Fatal(self.close(error)),
+        };
+        match self.write_bytes(&frame, TRANSACTION_TIMEOUT.min(KEEPALIVE_WRITE_TIMEOUT)) {
+            Ok(()) => {}
+            Err(error @ SessionError::Write(WriteError::TimedOut)) => {
+                return KeepaliveOutcome::Retryable(error);
+            }
+            Err(error) => return KeepaliveOutcome::Fatal(self.close(error)),
+        }
+        match self.await_optional_reply(None) {
+            Ok(reply) => KeepaliveOutcome::Sent(reply),
+            Err(error) => KeepaliveOutcome::Fatal(self.close(error)),
+        }
     }
 
     /// One tracked exchange: drain, write the request built for a fresh
@@ -317,7 +449,7 @@ impl<T: Transport> Session<T> {
         self.ensure_open()?;
         let track = self.allocate_track();
         let frame = framed(&request(track))?;
-        self.drain(DRAIN_WINDOW)?;
+        self.drain_queued()?;
         if let Err(error) = self.write_bytes(&frame, TRANSACTION_TIMEOUT) {
             return Err(self.close(error));
         }
@@ -403,7 +535,7 @@ impl<T: Transport> Session<T> {
     /// deadline. Any other failure closes the session.
     pub fn bootstrap(&mut self) -> Result<Bootstrap, SessionError> {
         self.ensure_open()?;
-        self.drain(DRAIN_WINDOW)?;
+        self.drain_queued()?;
 
         let probe = framed(&wire::device_information_query())?;
         let started = self.clock.now();
@@ -475,7 +607,7 @@ impl<T: Transport> Session<T> {
     /// One untracked exchange sent exactly once: drain, write, and wait for
     /// the exact response body. Any failure closes the session.
     fn bootstrap_exchange(&mut self, payload: &[u8], expected_body: u32) -> Result<Vec<u8>, SessionError> {
-        self.drain(DRAIN_WINDOW)?;
+        self.drain_queued()?;
         let frame = framed(payload)?;
         if let Err(error) = self.write_bytes(&frame, TRANSACTION_TIMEOUT.min(BOOTSTRAP_WRITE_TIMEOUT)) {
             return Err(self.close(error));
@@ -716,7 +848,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.queue_read(bytes).queue_timeout();
         let mut session = session(mock);
-        let drained = session.drain(Duration::from_millis(30)).unwrap();
+        let drained = session.drain_queued().unwrap();
         assert_eq!(drained, vec![b"one".to_vec(), b"two".to_vec()]);
         assert!(session.is_open());
         assert_eq!(session.decoder.buffered(), 0);
@@ -725,8 +857,17 @@ mod tests {
     #[test]
     fn drain_with_nothing_queued_is_empty() {
         let mut session = session(MockTransport::new());
-        assert_eq!(session.drain(Duration::from_millis(5)), Ok(Vec::new()));
+        assert_eq!(session.drain_queued(), Ok(Vec::new()));
         assert!(session.is_open());
+    }
+
+    #[test]
+    fn drain_does_not_wait_for_a_pending_reply() {
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(encode(b"reply").unwrap());
+        let mut session = session(mock);
+        assert_eq!(session.drain_queued(), Ok(Vec::new()));
+        assert_eq!(session.into_transport().pending_reads(), 2);
     }
 
     #[test]
@@ -739,10 +880,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.queue_read(bytes);
         let mut session = session(mock);
-        assert_eq!(
-            session.drain(Duration::from_millis(500)),
-            Err(SessionError::TooManySkipped)
-        );
+        assert_eq!(session.drain_queued(), Err(SessionError::TooManySkipped));
         assert!(!session.is_open());
     }
 
@@ -1375,5 +1513,172 @@ mod tests {
         let (mut session, _) = tracked_session(mock, 41);
         assert!(session.query_user_configuration().is_err());
         assert_eq!(session.query_user_configuration(), Err(SessionError::Closed));
+    }
+
+    fn trigger_frame(track: u64) -> Vec<u8> {
+        encode(&wire::activation_trigger(NonZeroU64::new(track).unwrap())).unwrap()
+    }
+
+    fn acknowledgement(track: u64) -> Vec<u8> {
+        response(
+            Some(tracked_header(track)),
+            None,
+            Some((field::ACKNOWLEDGEMENT, Message::new())),
+        )
+    }
+
+    #[test]
+    fn activate_writes_the_trigger_and_takes_the_acknowledgement() {
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(acknowledgement(41));
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(session.activate(), Ok(OptionalReply::Acknowledged));
+        assert!(session.is_open());
+        let mock = session.into_transport();
+        assert_eq!(mock.writes, vec![trigger_frame(41)]);
+        assert_eq!(mock.pending_reads(), 0);
+    }
+
+    #[test]
+    fn activate_accepts_no_reply() {
+        let mut mock = MockTransport::new();
+        mock.queue_wait_for_write();
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(session.activate(), Ok(OptionalReply::None));
+        assert!(session.is_open());
+    }
+
+    #[test]
+    fn activate_consumes_one_unrelated_frame() {
+        let pong = response(None, None, Some((field::PONG, Message::new().bytes(1, b"hello?"))));
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(pong).queue_read(acknowledgement(41));
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(session.activate(), Ok(OptionalReply::Drained));
+        assert!(session.is_open());
+        assert_eq!(session.into_transport().pending_reads(), 1);
+    }
+
+    #[test]
+    fn activate_discards_a_partial_frame_at_the_deadline() {
+        let partial = acknowledgement(41)[..5].to_vec();
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(partial);
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(session.activate(), Ok(OptionalReply::None));
+        assert!(session.is_open());
+        assert_eq!(session.decoder.buffered(), 0);
+    }
+
+    #[test]
+    fn activate_treats_a_malformed_reply_as_drained() {
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(encode(&[0x0a, 0x09, 0x08]).unwrap());
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(session.activate(), Ok(OptionalReply::Drained));
+        assert!(session.is_open());
+    }
+
+    #[test]
+    fn activate_closes_on_a_matching_rejection() {
+        let rejected = response(
+            Some(tracked_header(41)),
+            Some(Message::new().uint(1, 1).bytes(2, b"no")),
+            None,
+        );
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(rejected);
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(
+            session.activate(),
+            Err(SessionError::Rejected(ProtocolError {
+                code: 1,
+                why: "no".into()
+            }))
+        );
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn activate_closes_on_an_unrelated_error_frame() {
+        let rejected = response(
+            Some(tracked_header(9)),
+            Some(Message::new().uint(1, 2)),
+            Some((field::ACKNOWLEDGEMENT, Message::new())),
+        );
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(rejected);
+        let (mut session, _) = tracked_session(mock, 41);
+        assert!(matches!(session.activate(), Err(SessionError::Rejected(_))));
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn activate_closes_on_a_write_failure() {
+        let mut mock = MockTransport::new();
+        mock.queue_write_result(Err(WriteError::TimedOut));
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(
+            session.activate(),
+            Err(SessionError::Write(WriteError::TimedOut))
+        );
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn ping_writes_the_keepalive_and_accepts_silence() {
+        let mut mock = MockTransport::new();
+        mock.queue_wait_for_write();
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(session.ping(), KeepaliveOutcome::Sent(OptionalReply::None));
+        assert!(session.is_open());
+        let mock = session.into_transport();
+        assert_eq!(mock.writes, vec![encode(&wire::keepalive_ping()).unwrap()]);
+    }
+
+    #[test]
+    fn ping_consumes_an_optional_pong() {
+        let pong = response(None, None, Some((field::PONG, Message::new().bytes(1, b"hello?"))));
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(pong);
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(session.ping(), KeepaliveOutcome::Sent(OptionalReply::Drained));
+        assert!(session.is_open());
+    }
+
+    #[test]
+    fn ping_zero_byte_timeout_is_retryable_and_keeps_the_session() {
+        let mut mock = MockTransport::new();
+        mock.queue_write_result(Err(WriteError::TimedOut));
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(
+            session.ping(),
+            KeepaliveOutcome::Retryable(SessionError::Write(WriteError::TimedOut))
+        );
+        assert!(session.is_open());
+        assert_eq!(session.ping(), KeepaliveOutcome::Sent(OptionalReply::None));
+    }
+
+    #[test]
+    fn ping_partial_write_is_fatal() {
+        let mut mock = MockTransport::new();
+        mock.queue_write_result(Err(WriteError::Partial { written: 4 }));
+        let (mut session, _) = tracked_session(mock, 41);
+        assert_eq!(
+            session.ping(),
+            KeepaliveOutcome::Fatal(SessionError::Write(WriteError::Partial { written: 4 }))
+        );
+        assert!(!session.is_open());
+        assert_eq!(session.ping(), KeepaliveOutcome::Fatal(SessionError::Closed));
+    }
+
+    #[test]
+    fn ping_error_frame_is_fatal() {
+        let rejected = response(None, Some(Message::new().uint(1, 1)), None);
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(rejected);
+        let (mut session, _) = tracked_session(mock, 41);
+        assert!(matches!(session.ping(), KeepaliveOutcome::Fatal(SessionError::Rejected(_))));
+        assert!(!session.is_open());
     }
 }

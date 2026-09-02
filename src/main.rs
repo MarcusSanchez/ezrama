@@ -9,6 +9,7 @@ Usage: ezrama <command> [options]
 Commands:
   probe      Find the Panorama SE printer interface and open it briefly
   info       Start a session and print the device's state; changes nothing
+  activate   Start a session and switch the panel to its stored media once
   help       Show this message
   version    Print the version
 
@@ -27,6 +28,7 @@ fn main() -> ExitCode {
     match command {
         Some("probe") => probe(verbose, io_check),
         Some("info") => info(),
+        Some("activate") => activate(),
         Some("version") => {
             println!("{NAME} {VERSION}");
             ExitCode::SUCCESS
@@ -318,6 +320,73 @@ fn info() -> ExitCode {
     }
 }
 
+/// Starts a session, sends the activation trigger and one Ping, reports
+/// which media the panel is configured to show, and exits.
+#[cfg(windows)]
+fn activate() -> ExitCode {
+    use ezrama::overlapped::UsbprintTransport;
+    use ezrama::session::{KeepaliveOutcome, OptionalReply, Session};
+    use std::time::Instant;
+
+    let path = match win_cli::locate() {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+    let device = match win_cli::open(&path) {
+        Ok(device) => device,
+        Err(code) => return code,
+    };
+    let mut session = Session::new(UsbprintTransport::new(device));
+
+    let started = Instant::now();
+    let bootstrap = match session.bootstrap() {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            eprintln!("session start failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "session started in {} ms: {} firmware {}",
+        started.elapsed().as_millis(),
+        show(&bootstrap.device.product_name),
+        show(&bootstrap.device.firmware_version)
+    );
+
+    match session.activate() {
+        Ok(OptionalReply::Acknowledged) => println!("activation trigger acknowledged"),
+        Ok(OptionalReply::None) => println!("activation trigger sent; no reply within the window"),
+        Ok(OptionalReply::Drained) => println!("activation trigger sent; an unrelated frame was consumed"),
+        Err(error) => {
+            eprintln!("activation failed: {error}");
+            return ExitCode::from(1);
+        }
+    }
+
+    match session.ping() {
+        KeepaliveOutcome::Sent(OptionalReply::None) => println!("ping sent; no reply within the window"),
+        KeepaliveOutcome::Sent(_) => println!("ping sent; a reply was consumed"),
+        KeepaliveOutcome::Retryable(error) => println!("ping did not transfer: {error}"),
+        KeepaliveOutcome::Fatal(error) => {
+            eprintln!("ping failed: {error}");
+            return ExitCode::from(1);
+        }
+    }
+
+    match session.query_user_configuration() {
+        Ok(config) => match config.work {
+            Some(work) => println!("panel is configured to show {}", show(&work.single_mode_media_file)),
+            None => println!("panel reported no work configuration"),
+        },
+        Err(error) => {
+            eprintln!("configuration query failed: {error}");
+            return ExitCode::from(1);
+        }
+    }
+    println!("done in {} ms", started.elapsed().as_millis());
+    ExitCode::SUCCESS
+}
+
 /// Renders a device string, making an empty one visible.
 fn show(value: &str) -> &str {
     if value.is_empty() {
@@ -336,5 +405,11 @@ fn probe(_verbose: bool, _io_check: bool) -> ExitCode {
 #[cfg(not(windows))]
 fn info() -> ExitCode {
     eprintln!("info is only available on Windows");
+    ExitCode::from(1)
+}
+
+#[cfg(not(windows))]
+fn activate() -> ExitCode {
+    eprintln!("activate is only available on Windows");
     ExitCode::from(1)
 }
