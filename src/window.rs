@@ -52,6 +52,7 @@ static STATE: AtomicU8 = AtomicU8::new(State::Starting as u8);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static TRAY: Mutex<Option<TrayIcon>> = Mutex::new(None);
 static KANALI_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static STOPPING: AtomicBool = AtomicBool::new(false);
 
 /// A request sent to a running watcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +128,15 @@ pub fn state() -> State {
 pub fn set_state(state: State) {
     STATE.store(state as u8, Ordering::SeqCst);
     post(local_window(), WM_STATE_CHANGED);
+}
+
+/// Ends the message loop. The flag backs up the quit message, which a
+/// modal loop such as an open menu can consume.
+fn quit() {
+    STOPPING.store(true, Ordering::SeqCst);
+    unsafe {
+        PostQuitMessage(0);
+    }
 }
 
 fn tooltip(state: State) -> String {
@@ -329,8 +339,11 @@ fn show_menu(window: HWND) {
         Some(MENU_PAUSE) => post_event(Event::Pause),
         Some(MENU_RESUME) => post_event(Event::Resume),
         Some(MENU_OPEN_KANALI) => post_event(Event::OpenKanali),
-        Some(MENU_QUIT) => unsafe { PostQuitMessage(0) },
+        Some(MENU_QUIT) => quit(),
         _ => {}
+    }
+    if STOPPING.load(Ordering::SeqCst) {
+        quit();
     }
 }
 
@@ -391,13 +404,13 @@ unsafe extern "system" fn window_procedure(
             0
         }
         WM_STOP_WATCH | WM_CLOSE => {
-            PostQuitMessage(0);
+            quit();
             0
         }
         WM_QUERYENDSESSION => 1,
         WM_ENDSESSION => {
             if wparam != 0 {
-                PostQuitMessage(0);
+                quit();
             }
             0
         }
@@ -424,6 +437,7 @@ pub fn run_message_loop(sender: Sender<Event>, setup: Setup) -> Result<(), WinEr
         *slot = Some(sender.clone());
     }
     KANALI_AVAILABLE.store(setup.kanali_available, Ordering::SeqCst);
+    STOPPING.store(false, Ordering::SeqCst);
 
     let class_name = wide(WINDOW_CLASS);
     let instance = unsafe { GetModuleHandleW(ptr::null()) };
@@ -511,7 +525,7 @@ pub fn run_message_loop(sender: Sender<Event>, setup: Setup) -> Result<(), WinEr
     };
     loop {
         let result = unsafe { GetMessageW(&mut message, ptr::null_mut(), 0, 0) };
-        if result <= 0 {
+        if result <= 0 || STOPPING.load(Ordering::SeqCst) {
             break;
         }
         unsafe {
