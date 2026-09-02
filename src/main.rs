@@ -18,7 +18,7 @@ Options:
   -v, --verbose        Extra detail: interfaces and exclusivity for probe,
                        one line per ping for run
   --io                 With probe: arm one read, cancel it, and reap it
-  --interval <secs>    With run: seconds between pings (default 2)
+  --interval <secs>    With run: seconds between pings (default 4.5)
 ";
 
 fn main() -> ExitCode {
@@ -487,12 +487,12 @@ fn run(verbose: bool, interval: std::time::Duration) -> ExitCode {
     }
 }
 
-/// Parses `--interval <seconds>`; the reference's 2 s when absent.
+/// Parses `--interval <seconds>`; the built-in interval when absent.
 fn interval_argument(args: &[String]) -> Result<std::time::Duration, String> {
     use std::time::Duration;
 
     let Some(position) = args.iter().position(|a| a == "--interval") else {
-        return Ok(Duration::from_millis(2000));
+        return Ok(ezrama::hold::KEEPALIVE_INTERVAL);
     };
     let Some(value) = args.get(position + 1) else {
         return Err("--interval needs a value in seconds".to_string());

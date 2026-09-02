@@ -6,7 +6,9 @@ use crate::session::{KeepaliveOutcome, OptionalReply, Session, SessionError};
 use crate::transport::Transport;
 
 /// Time between keepalive Pings, measured from the last outbound write.
-pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(2000);
+/// The panel blanks after 5 s of silence; this leaves half a second of
+/// margin over the loop's own overhead.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(4500);
 /// Consecutive retryable Ping write failures tolerated before the session
 /// is given up.
 pub const KEEPALIVE_WRITE_RETRIES: u32 = 3;
@@ -138,7 +140,7 @@ mod tests {
                 HoldEvent::Stopped,
             ]
         );
-        assert_eq!(clock.elapsed(), Duration::from_millis(6000));
+        assert_eq!(clock.elapsed(), KEEPALIVE_INTERVAL * 3);
         assert!(session.is_open());
         let mock = session.into_transport();
         assert_eq!(mock.writes.len(), 3);
