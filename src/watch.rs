@@ -28,6 +28,17 @@ pub enum Event {
     Quit,
 }
 
+impl Event {
+    /// Whether the event should cut short whatever the watcher is doing:
+    /// a hold, a session start, a wait. The others can wait their turn.
+    pub fn interrupts(&self) -> bool {
+        matches!(
+            self,
+            Event::Pause | Event::OpenKanali | Event::Quit | Event::Removed(_)
+        )
+    }
+}
+
 /// What the supervisor should do after handling an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Directive {
@@ -278,6 +289,17 @@ mod tests {
         let mut control = Control::new();
         control.apply(&Event::KanaliClosed);
         assert!(!control.paused(), "a stray close changes nothing");
+    }
+
+    #[test]
+    fn only_events_that_change_the_mode_interrupt() {
+        assert!(Event::Pause.interrupts());
+        assert!(Event::OpenKanali.interrupts());
+        assert!(Event::Quit.interrupts());
+        assert!(Event::Removed("a".into()).interrupts());
+        assert!(!Event::Arrived("a".into()).interrupts());
+        assert!(!Event::Resume.interrupts());
+        assert!(!Event::KanaliClosed.interrupts());
     }
 
     #[test]

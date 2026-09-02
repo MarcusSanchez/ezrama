@@ -9,8 +9,9 @@ use crate::hold::{hold, HoldEvent, KEEPALIVE_WRITE_RETRIES};
 use crate::launcher;
 use crate::log::Logger;
 use crate::overlapped::UsbprintTransport;
-use crate::session::{KeepaliveOutcome, OptionalReply, Session};
-use crate::supervisor::{Backend, Hold, Panel};
+use crate::session::{KeepaliveOutcome, OptionalReply, Session, SessionError};
+use crate::supervisor::{Backend, Hold, Panel, StartError};
+use crate::transport::ReadError;
 use crate::usbprint::{self, Device, Discovery};
 use crate::watch::{Event, State};
 use crate::window::{self, PausedSignal};
@@ -55,17 +56,33 @@ fn show(value: &str) -> &str {
     }
 }
 
+/// Whether a session error is the interrupt cutting a wait short.
+fn interrupted(error: &SessionError) -> bool {
+    matches!(error, SessionError::Read(ReadError::Interrupted))
+}
+
+/// Turns a session error during the start into the start's outcome.
+fn start_error(context: &str, error: SessionError) -> StartError {
+    if interrupted(&error) {
+        StartError::Interrupted
+    } else {
+        StartError::Failed(format!("{context}: {error}"))
+    }
+}
+
 /// Runs the session start on an open device: bootstrap, the activation
 /// trigger, and the first Ping. Each step is reported through `report`.
+/// The watcher's interrupt cuts any wait short.
 pub fn establish(
     device: Device,
     report: &mut dyn FnMut(&str),
-) -> Result<Session<UsbprintTransport>, String> {
-    let mut session = Session::new(UsbprintTransport::new(device));
+) -> Result<Session<UsbprintTransport>, StartError> {
+    let transport = UsbprintTransport::new(device).with_interrupt(window::interrupt_event());
+    let mut session = Session::new(transport);
     let started = Instant::now();
     let bootstrap = session
         .bootstrap()
-        .map_err(|error| format!("session start failed: {error}"))?;
+        .map_err(|error| start_error("session start failed", error))?;
     report(&format!(
         "session started in {} ms: {} firmware {}",
         started.elapsed().as_millis(),
@@ -79,7 +96,7 @@ pub fn establish(
         Ok(OptionalReply::Drained) => {
             report("activation trigger sent; an unrelated frame was consumed")
         }
-        Err(error) => return Err(format!("activation failed: {error}")),
+        Err(error) => return Err(start_error("activation failed", error)),
     }
 
     match session.ping() {
@@ -88,7 +105,7 @@ pub fn establish(
         }
         KeepaliveOutcome::Sent(_) => report("ping sent; a reply was consumed"),
         KeepaliveOutcome::Retryable(error) => report(&format!("ping did not transfer: {error}")),
-        KeepaliveOutcome::Fatal(error) => return Err(format!("ping failed: {error}")),
+        KeepaliveOutcome::Fatal(error) => return Err(start_error("ping failed", error)),
     }
     Ok(session)
 }
@@ -144,9 +161,9 @@ impl Backend for WindowsBackend {
         }
     }
 
-    fn start_session(&mut self, path: &str, log: &mut Logger) -> Result<(), String> {
+    fn start_session(&mut self, path: &str, log: &mut Logger) -> Result<(), StartError> {
         let session = Device::open(path)
-            .map_err(|error| error.to_string())
+            .map_err(|error| StartError::Failed(error.to_string()))
             .and_then(|device| establish(device, &mut |line| log.log(line)))?;
         self.session = Some(session);
         Ok(())
@@ -182,6 +199,7 @@ impl Backend for WindowsBackend {
         drop(session);
         match result {
             Ok(()) => Hold::Stopped { pings },
+            Err(error) if interrupted(&error) => Hold::Stopped { pings },
             Err(error) => Hold::Lost { pings, error },
         }
     }

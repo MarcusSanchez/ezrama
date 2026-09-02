@@ -443,7 +443,8 @@ fn activate() -> ExitCode {
 fn run(verbose: bool, interval: Duration) -> ExitCode {
     use crate::backend::stop_signal;
     use crate::hold::{hold, HoldEvent, KEEPALIVE_WRITE_RETRIES};
-    use crate::session::OptionalReply;
+    use crate::session::{OptionalReply, SessionError};
+    use crate::transport::ReadError;
 
     let mut session = match win_cli::start_session() {
         Ok(session) => session,
@@ -485,6 +486,10 @@ fn run(verbose: bool, interval: Duration) -> ExitCode {
     match result {
         Ok(()) => {
             println!("session released");
+            ExitCode::SUCCESS
+        }
+        Err(SessionError::Read(ReadError::Interrupted)) => {
+            println!("stop requested after {pings} pings; session released");
             ExitCode::SUCCESS
         }
         Err(error) => {

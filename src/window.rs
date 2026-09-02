@@ -15,7 +15,7 @@ use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::overlapped::wait_millis;
@@ -48,6 +48,7 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static TRAY: Mutex<Option<TrayIcon>> = Mutex::new(None);
 static KANALI_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static STOPPING: AtomicBool = AtomicBool::new(false);
+static INTERRUPT_EVENT: OnceLock<usize> = OnceLock::new();
 
 /// A request sent to a running watcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,19 +79,38 @@ pub struct Setup {
     pub kanali_available: bool,
 }
 
-/// Whether an event has arrived since the flag was last cleared.
+/// Whether an interrupting event has arrived since the flag was last
+/// cleared.
 pub fn interrupted() -> bool {
     INTERRUPT.load(Ordering::SeqCst)
 }
 
-/// Clears the interrupt flag once the pending events have been handled.
-pub fn clear_interrupt() {
-    INTERRUPT.store(false, Ordering::SeqCst);
+/// The manual-reset event that mirrors the interrupt flag, for waits that
+/// should end early when an event arrives. Created on first use and kept
+/// for the life of the process.
+pub fn interrupt_event() -> HANDLE {
+    let handle = INTERRUPT_EVENT.get_or_init(|| {
+        let handle = unsafe { CreateEventW(ptr::null_mut(), 1, 0, ptr::null()) };
+        handle as usize
+    });
+    *handle as HANDLE
 }
 
-/// Raises the interrupt flag without an event, for a stop from elsewhere.
+/// Clears the interrupt once the pending events have been handled.
+pub fn clear_interrupt() {
+    INTERRUPT.store(false, Ordering::SeqCst);
+    unsafe {
+        ResetEvent(interrupt_event());
+    }
+}
+
+/// Raises the interrupt: the flag for loops that poll it, the event for
+/// waits that block on it.
 pub fn interrupt() {
     INTERRUPT.store(true, Ordering::SeqCst);
+    unsafe {
+        SetEvent(interrupt_event());
+    }
 }
 
 fn local_window() -> HWND {
@@ -276,9 +296,12 @@ pub fn wait_named(name: &str, timeout: Duration) -> Result<bool, WinError> {
     Ok(waited == WAIT_OBJECT_0)
 }
 
-/// Hands an event to the supervisor and interrupts a holding loop.
+/// Hands an event to the supervisor, interrupting whatever it is doing
+/// when the event calls for that.
 pub fn post_event(event: Event) {
-    INTERRUPT.store(true, Ordering::SeqCst);
+    if event.interrupts() {
+        interrupt();
+    }
     if let Ok(sender) = SENDER.lock() {
         if let Some(sender) = sender.as_ref() {
             let _ = sender.send(event);
@@ -608,6 +631,7 @@ mod tests {
         assert_eq!(state(), State::Active);
 
         clear_interrupt();
+        assert!(!interrupted());
         assert!(request(Request::Pause));
         assert!(request(Request::Resume));
         assert!(request(Request::OpenKanali));

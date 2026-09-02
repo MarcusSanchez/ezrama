@@ -19,6 +19,24 @@ pub enum Panel {
     Several(usize),
 }
 
+/// Why a session start did not produce a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartError {
+    /// An event cut the attempt short; nothing is wrong with the display.
+    Interrupted,
+    /// The attempt failed for this reason.
+    Failed(String),
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::Interrupted => write!(f, "session start interrupted"),
+            StartError::Failed(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
 /// How a held session ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hold {
@@ -42,7 +60,7 @@ pub trait Backend {
     fn find_panel(&mut self) -> Result<Panel, String>;
     /// Opens the display at `path` and runs the session start, logging
     /// each step.
-    fn start_session(&mut self, path: &str, log: &mut Logger) -> Result<(), String>;
+    fn start_session(&mut self, path: &str, log: &mut Logger) -> Result<(), StartError>;
     /// Holds the started session until interrupted or lost, then releases
     /// it.
     fn hold_session(&mut self, interval: Duration, verbose: bool, log: &mut Logger) -> Hold;
@@ -197,10 +215,17 @@ impl<B: Backend> Supervisor<B> {
         };
 
         self.backend.report(State::Connecting);
-        if let Err(message) = self.backend.start_session(&path, &mut self.log) {
-            let delay = self.reconnect.next_delay();
-            self.log.log(&format!("{message}; retrying in {} s", delay.as_secs()));
-            return self.wait(events, Some(delay));
+        match self.backend.start_session(&path, &mut self.log) {
+            Ok(()) => {}
+            Err(StartError::Interrupted) => {
+                self.log.log("session start interrupted");
+                return Directive::Continue;
+            }
+            Err(StartError::Failed(message)) => {
+                let delay = self.reconnect.next_delay();
+                self.log.log(&format!("{message}; retrying in {} s", delay.as_secs()));
+                return self.wait(events, Some(delay));
+            }
         }
         self.reconnect.reset();
         self.backend.report(State::Active);
@@ -237,7 +262,7 @@ mod tests {
     struct Fake {
         sender: Sender<Event>,
         panels: VecDeque<Result<Panel, String>>,
-        starts: VecDeque<Result<(), String>>,
+        starts: VecDeque<Result<(), StartError>>,
         holds: VecDeque<Hold>,
         launches: VecDeque<bool>,
         on_report: VecDeque<Vec<Event>>,
@@ -268,7 +293,7 @@ mod tests {
             self
         }
 
-        fn start(mut self, outcome: Result<(), String>) -> Self {
+        fn start(mut self, outcome: Result<(), StartError>) -> Self {
             self.starts.push_back(outcome);
             self
         }
@@ -324,7 +349,7 @@ mod tests {
             self.panels.pop_front().expect("the script has no more panels")
         }
 
-        fn start_session(&mut self, path: &str, _log: &mut Logger) -> Result<(), String> {
+        fn start_session(&mut self, path: &str, _log: &mut Logger) -> Result<(), StartError> {
             self.calls.push(format!("start {path}"));
             self.starts.pop_front().expect("the script has no more starts")
         }
@@ -382,7 +407,7 @@ mod tests {
             .start(Ok(()))
             .hold(lost(7))
             .panel(one())
-            .start(Err("session start failed".into()))
+            .start(Err(StartError::Failed("session start failed".into())))
             .panel(one())
             .start(Ok(()))
             .then(vec![])
@@ -537,6 +562,27 @@ mod tests {
             [State::NoDisplay, State::NoDisplay, State::Connecting, State::Active, State::Quitting]
         );
         assert_eq!(fake.calls, ["find", "find", "find", "start panel", "hold 4500"]);
+    }
+
+    #[test]
+    fn an_interrupted_start_is_not_a_failure() {
+        let (sender, events) = mpsc::channel();
+        let fake = Fake::new(sender)
+            .panel(one())
+            .then(vec![Event::Pause])
+            .start(Err(StartError::Interrupted))
+            .then(vec![Event::Resume])
+            .panel(one())
+            .start(Ok(()))
+            .then(vec![])
+            .then(vec![Event::Quit])
+            .hold(Hold::Stopped { pings: 0 });
+        let fake = run(fake, &events);
+        assert_eq!(
+            fake.states,
+            [State::Connecting, State::Paused, State::Connecting, State::Active, State::Quitting]
+        );
+        assert_eq!(fake.calls, ["find", "start panel", "find", "start panel", "hold 4500"]);
     }
 
     #[test]

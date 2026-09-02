@@ -47,6 +47,9 @@ pub enum ReadError {
     Lost(String),
     /// A call failed in a way that does not condemn the transport.
     Failed(String),
+    /// The wait was cut short by an interrupt; the transport is still
+    /// usable.
+    Interrupted,
 }
 
 impl fmt::Display for ReadError {
@@ -54,6 +57,7 @@ impl fmt::Display for ReadError {
         match self {
             ReadError::Lost(reason) => write!(f, "device lost: {reason}"),
             ReadError::Failed(reason) => write!(f, "read failed: {reason}"),
+            ReadError::Interrupted => write!(f, "read interrupted"),
         }
     }
 }

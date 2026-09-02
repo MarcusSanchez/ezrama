@@ -76,6 +76,13 @@ enum Completion {
     Error(WinError, usize),
 }
 
+/// How a wait for the armed read ended.
+enum Waited {
+    Timeout,
+    Interrupted,
+    Completed(Completion),
+}
+
 impl Completion {
     fn transferred(&self) -> usize {
         match self {
@@ -131,6 +138,7 @@ pub struct UsbprintTransport {
     read_errors: u32,
     lost: Option<String>,
     device: Device,
+    interrupt: Option<HANDLE>,
 }
 
 // The transport is used from one thread at a time and may move between
@@ -145,7 +153,16 @@ impl UsbprintTransport {
             read_errors: 0,
             lost: None,
             device,
+            interrupt: None,
         }
+    }
+
+    /// Makes every read wait end early, with [`ReadError::Interrupted`],
+    /// while the manual-reset event `interrupt` is set. The handle stays
+    /// owned by the caller.
+    pub fn with_interrupt(mut self, interrupt: HANDLE) -> Self {
+        self.interrupt = Some(interrupt);
+        self
     }
 
     pub fn device(&self) -> &Device {
@@ -251,20 +268,35 @@ impl UsbprintTransport {
         }
     }
 
-    /// Waits up to `timeout` for the armed read. On completion the transfer
-    /// is reaped and its buffer released; the read is not re-armed.
-    fn wait_read(&mut self, timeout: Duration) -> Option<Completion> {
-        let event = self.read.as_ref()?.event;
-        let waited = unsafe { WaitForSingleObject(event, wait_millis(timeout)) };
-        if waited != WAIT_OBJECT_0 {
-            return None;
+    /// Waits up to `timeout` for the armed read, or for the interrupt if
+    /// one is set. On completion the transfer is reaped and its buffer
+    /// released; the read is not re-armed. An interrupt leaves it armed.
+    fn wait_read(&mut self, timeout: Duration) -> Waited {
+        let Some(pending) = self.read.as_ref() else {
+            return Waited::Timeout;
+        };
+        let event = pending.event;
+        let waited = match self.interrupt {
+            Some(interrupt) => {
+                let handles = [event, interrupt];
+                unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, wait_millis(timeout)) }
+            }
+            None => unsafe { WaitForSingleObject(event, wait_millis(timeout)) },
+        };
+        if self.interrupt.is_some() && waited == WAIT_OBJECT_0 + 1 {
+            return Waited::Interrupted;
         }
-        let mut pending = self.read.take()?;
+        if waited != WAIT_OBJECT_0 {
+            return Waited::Timeout;
+        }
+        let Some(mut pending) = self.read.take() else {
+            return Waited::Timeout;
+        };
         let completion = self.completion(&mut pending);
         if let Completion::Done(n) | Completion::Aborted(n) = completion {
             self.queue.extend_from_slice(&pending.buffer[..n.min(pending.buffer.len())]);
         }
-        Some(completion)
+        Waited::Completed(completion)
     }
 
     /// Applies a read completion: counts bytes, resets or advances the error
@@ -336,8 +368,9 @@ impl Transport for UsbprintTransport {
             self.arm_read()?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.wait_read(remaining) {
-                None => return Ok(Vec::new()),
-                Some(completion) => {
+                Waited::Timeout => return Ok(Vec::new()),
+                Waited::Interrupted => return Err(ReadError::Interrupted),
+                Waited::Completed(completion) => {
                     let queued = self.apply_read_completion(completion)?;
                     if queued > 0 {
                         return Ok(mem::take(&mut self.queue));
@@ -357,6 +390,10 @@ impl Transport for UsbprintTransport {
         self.arm_read().map_err(|error| match error {
             ReadError::Lost(reason) => WriteError::Lost(reason),
             ReadError::Failed(reason) => WriteError::Failed { written: 0, reason },
+            ReadError::Interrupted => WriteError::Failed {
+                written: 0,
+                reason: "interrupted".to_string(),
+            },
         })?;
 
         let mut pending = Pending::new(data.to_vec()).map_err(|error| WriteError::Failed {
@@ -432,7 +469,7 @@ impl Transport for UsbprintTransport {
         };
         drop(pending);
 
-        if let Some(completion) = self.wait_read(Duration::ZERO) {
+        if let Waited::Completed(completion) = self.wait_read(Duration::ZERO) {
             let _ = self.apply_read_completion(completion);
         }
         result
@@ -461,6 +498,36 @@ impl Drop for UsbprintTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usbprint::{self, Discovery};
+
+    /// With the display present: an interrupt that is already set ends a
+    /// read wait at once and leaves the read armed; once cleared, the
+    /// same read times out normally and is reaped. Nothing is written.
+    #[test]
+    fn an_interrupt_ends_a_read_wait_early() {
+        let Ok(Discovery::One(path)) = usbprint::find_panorama() else {
+            return;
+        };
+        let Ok(device) = Device::open(&path) else {
+            return;
+        };
+        let interrupt = unsafe { CreateEventW(ptr::null_mut(), 1, 1, ptr::null()) };
+        let mut transport = UsbprintTransport::new(device).with_interrupt(interrupt);
+        let started = Instant::now();
+        assert_eq!(transport.read(Duration::from_secs(5)), Err(ReadError::Interrupted));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(transport.read_armed());
+        assert!(transport.lost().is_none());
+        unsafe {
+            ResetEvent(interrupt);
+        }
+        let read = transport.read(Duration::from_millis(100));
+        assert!(matches!(read, Ok(_)), "after the interrupt clears, reads work: {read:?}");
+        assert!(!matches!(transport.disarm_read(), Disarm::Abandoned));
+        unsafe {
+            CloseHandle(interrupt);
+        }
+    }
 
     #[test]
     fn overlapped_layout_matches_the_platform() {
