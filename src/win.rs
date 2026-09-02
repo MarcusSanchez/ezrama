@@ -12,11 +12,25 @@ pub type DWORD = u32;
 
 pub const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
 
+pub const ERROR_FILE_NOT_FOUND: DWORD = 2;
+pub const ERROR_PATH_NOT_FOUND: DWORD = 3;
+pub const ERROR_ACCESS_DENIED: DWORD = 5;
+pub const ERROR_GEN_FAILURE: DWORD = 31;
+pub const ERROR_SHARING_VIOLATION: DWORD = 32;
 pub const ERROR_INSUFFICIENT_BUFFER: DWORD = 122;
 pub const ERROR_NO_MORE_ITEMS: DWORD = 259;
+pub const ERROR_DEVICE_NOT_CONNECTED: DWORD = 1167;
 
 pub const DIGCF_PRESENT: DWORD = 0x0000_0002;
 pub const DIGCF_DEVICEINTERFACE: DWORD = 0x0000_0010;
+
+pub const GENERIC_READ: DWORD = 0x8000_0000;
+pub const GENERIC_WRITE: DWORD = 0x4000_0000;
+pub const OPEN_EXISTING: DWORD = 3;
+pub const FILE_FLAG_OVERLAPPED: DWORD = 0x4000_0000;
+
+pub const FORMAT_MESSAGE_IGNORE_INSERTS: DWORD = 0x0000_0200;
+pub const FORMAT_MESSAGE_FROM_SYSTEM: DWORD = 0x0000_1000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -78,4 +92,23 @@ extern "system" {
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GetLastError() -> DWORD;
+    pub fn FormatMessageW(
+        dwFlags: DWORD,
+        lpSource: *const c_void,
+        dwMessageId: DWORD,
+        dwLanguageId: DWORD,
+        lpBuffer: *mut u16,
+        nSize: DWORD,
+        Arguments: *mut c_void,
+    ) -> DWORD;
+    pub fn CreateFileW(
+        lpFileName: *const u16,
+        dwDesiredAccess: DWORD,
+        dwShareMode: DWORD,
+        lpSecurityAttributes: *mut c_void,
+        dwCreationDisposition: DWORD,
+        dwFlagsAndAttributes: DWORD,
+        hTemplateFile: HANDLE,
+    ) -> HANDLE;
+    pub fn CloseHandle(hObject: HANDLE) -> BOOL;
 }

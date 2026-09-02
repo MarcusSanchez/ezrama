@@ -7,12 +7,12 @@ const USAGE: &str = "\
 Usage: ezrama <command> [options]
 
 Commands:
-  probe      Find the Panorama SE printer interface
+  probe      Find the Panorama SE printer interface and open it briefly
   help       Show this message
   version    Print the version
 
 Options:
-  -v, --verbose    List every printer-class interface while probing
+  -v, --verbose    Show every printer-class interface and check exclusivity
 ";
 
 fn main() -> ExitCode {
@@ -53,7 +53,7 @@ fn main() -> ExitCode {
 
 #[cfg(windows)]
 fn probe(verbose: bool) -> ExitCode {
-    use ezrama::usbprint::{self, Discovery};
+    use ezrama::usbprint::{self, Device, Discovery, OpenError};
 
     if verbose {
         match usbprint::printer_interfaces() {
@@ -73,6 +73,29 @@ fn probe(verbose: bool) -> ExitCode {
     match usbprint::find_panorama() {
         Ok(Discovery::One(path)) => {
             println!("Panorama SE: {path}");
+            let device = match Device::open(&path) {
+                Ok(device) => device,
+                Err(error @ OpenError::Busy(_)) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(4);
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(1);
+                }
+            };
+            println!("opened for exclusive use");
+            if verbose {
+                match Device::open(&path) {
+                    Err(OpenError::Busy(error)) => {
+                        println!("second open refused while held: {error}");
+                    }
+                    Err(error) => println!("second open failed: {error}"),
+                    Ok(_) => println!("second open succeeded; the driver does not enforce exclusivity"),
+                }
+            }
+            drop(device);
+            println!("closed");
             ExitCode::SUCCESS
         }
         Ok(Discovery::Absent) => {

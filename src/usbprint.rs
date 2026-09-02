@@ -1,4 +1,4 @@
-//! Discovery of the display's USB printer-class interface through SetupAPI.
+//! Discovery and opening of the display's USB printer-class interface.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -27,15 +27,132 @@ impl WinError {
         let code = unsafe { GetLastError() };
         Self { call, code }
     }
+
+    /// The system's description of the error code, or empty if it has none.
+    pub fn message(&self) -> String {
+        let mut buffer = [0u16; 512];
+        let written = unsafe {
+            FormatMessageW(
+                FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                ptr::null(),
+                self.code,
+                0,
+                buffer.as_mut_ptr(),
+                buffer.len() as DWORD,
+                ptr::null_mut(),
+            )
+        };
+        String::from_utf16_lossy(&buffer[..written as usize])
+            .trim()
+            .to_string()
+    }
 }
 
 impl fmt::Display for WinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} failed with Windows error {}", self.call, self.code)
+        let message = self.message();
+        if message.is_empty() {
+            write!(f, "{} failed with Windows error {}", self.call, self.code)
+        } else {
+            write!(f, "{} failed: {} (Windows error {})", self.call, message, self.code)
+        }
     }
 }
 
 impl std::error::Error for WinError {}
+
+/// Why the device could not be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenError {
+    /// Another program holds the device.
+    Busy(WinError),
+    /// The interface path no longer refers to a working device.
+    Gone(WinError),
+    Other(WinError),
+}
+
+impl OpenError {
+    pub fn classify(error: WinError) -> Self {
+        match error.code {
+            ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION => OpenError::Busy(error),
+            ERROR_FILE_NOT_FOUND
+            | ERROR_PATH_NOT_FOUND
+            | ERROR_GEN_FAILURE
+            | ERROR_DEVICE_NOT_CONNECTED => OpenError::Gone(error),
+            _ => OpenError::Other(error),
+        }
+    }
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenError::Busy(error) => write!(f, "another program holds the device ({error})"),
+            OpenError::Gone(error) => write!(f, "the device is not available ({error})"),
+            OpenError::Other(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+/// An open handle on the display's printer interface.
+///
+/// The handle is opened for exclusive use with overlapped I/O and is closed
+/// when the value is dropped.
+#[derive(Debug)]
+pub struct Device {
+    handle: HANDLE,
+    path: String,
+}
+
+// A file handle may be used from any thread.
+unsafe impl Send for Device {}
+
+impl Device {
+    pub fn open(path: &str) -> Result<Self, OpenError> {
+        let wide_path = wide(path);
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(OpenError::classify(WinError::last("CreateFileW")));
+        }
+        Ok(Device {
+            handle,
+            path: path.to_string(),
+        })
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn handle(&self) -> HANDLE {
+        self.handle
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+/// NUL-terminated UTF-16 for Win32 wide-string parameters.
+pub fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
 
 /// Outcome of looking for the display.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,5 +338,41 @@ mod tests {
     fn interface_data_layout_matches_the_platform() {
         assert_eq!(mem::size_of::<SP_DEVICE_INTERFACE_DATA>(), 32);
         assert_eq!(mem::size_of::<GUID>(), 16);
+    }
+
+    fn error(code: DWORD) -> WinError {
+        WinError {
+            call: "CreateFileW",
+            code,
+        }
+    }
+
+    #[test]
+    fn open_errors_are_classified() {
+        assert_eq!(OpenError::classify(error(5)), OpenError::Busy(error(5)));
+        assert_eq!(OpenError::classify(error(32)), OpenError::Busy(error(32)));
+        for code in [2, 3, 31, 1167] {
+            assert_eq!(OpenError::classify(error(code)), OpenError::Gone(error(code)));
+        }
+        assert_eq!(OpenError::classify(error(87)), OpenError::Other(error(87)));
+    }
+
+    #[test]
+    fn wide_strings_are_nul_terminated() {
+        assert_eq!(wide(""), [0]);
+        assert_eq!(wide("ab"), [b'a' as u16, b'b' as u16, 0]);
+        assert_eq!(wide("\u{1F600}").len(), 3);
+    }
+
+    #[test]
+    fn system_messages_are_available_for_known_codes() {
+        assert!(!error(ERROR_ACCESS_DENIED).message().is_empty());
+        assert!(error(0xffff_ffff).message().is_empty());
+    }
+
+    #[test]
+    fn opening_a_missing_path_is_gone() {
+        let result = Device::open(r"\\?\usb#vid_0000&pid_0000#none#{28d78fad-5a12-11d1-ae5b-0000f803a8c2}");
+        assert!(matches!(result, Err(OpenError::Gone(_))), "{result:?}");
     }
 }
