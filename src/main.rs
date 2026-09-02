@@ -8,12 +8,13 @@ Usage: ezrama <command> [options]
 
 Commands:
   probe      Find the Panorama SE printer interface and open it briefly
+  info       Start a session and print the device's state; changes nothing
   help       Show this message
   version    Print the version
 
 Options:
   -v, --verbose    Show every printer-class interface and check exclusivity
-  --io             Arm one read, cancel it, and reap it; sends nothing
+  --io             With probe: arm one read, cancel it, and reap it
 ";
 
 fn main() -> ExitCode {
@@ -25,6 +26,7 @@ fn main() -> ExitCode {
     let wants_help = args.iter().any(|a| a == "--help" || a == "-h");
     match command {
         Some("probe") => probe(verbose, io_check),
+        Some("info") => info(),
         Some("version") => {
             println!("{NAME} {VERSION}");
             ExitCode::SUCCESS
@@ -53,9 +55,61 @@ fn main() -> ExitCode {
     }
 }
 
+/// Exit code when another program holds the device.
+const EXIT_BUSY: u8 = 4;
+/// Exit code when more than one display is present.
+const EXIT_SEVERAL: u8 = 3;
+
+#[cfg(windows)]
+mod win_cli {
+    use super::{EXIT_BUSY, EXIT_SEVERAL};
+    use ezrama::usbprint::{self, Device, Discovery, OpenError};
+    use std::process::ExitCode;
+
+    /// Finds the one display, printing why when that is not possible.
+    pub fn locate() -> Result<String, ExitCode> {
+        match usbprint::find_panorama() {
+            Ok(Discovery::One(path)) => {
+                println!("Panorama SE: {path}");
+                Ok(path)
+            }
+            Ok(Discovery::Absent) => {
+                eprintln!("no Panorama SE printer interface is present");
+                Err(ExitCode::from(1))
+            }
+            Ok(Discovery::Several(paths)) => {
+                eprintln!("{} Panorama SE printer interfaces are present:", paths.len());
+                for path in &paths {
+                    eprintln!("  {path}");
+                }
+                Err(ExitCode::from(EXIT_SEVERAL))
+            }
+            Err(error) => {
+                eprintln!("discovery failed: {error}");
+                Err(ExitCode::from(1))
+            }
+        }
+    }
+
+    /// Opens the display, printing why when that is not possible.
+    pub fn open(path: &str) -> Result<Device, ExitCode> {
+        match Device::open(path) {
+            Ok(device) => Ok(device),
+            Err(error @ OpenError::Busy(_)) => {
+                eprintln!("{error}");
+                Err(ExitCode::from(EXIT_BUSY))
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Err(ExitCode::from(1))
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 fn probe(verbose: bool, io_check: bool) -> ExitCode {
-    use ezrama::usbprint::{self, Device, Discovery, OpenError};
+    use ezrama::usbprint::{self, Device, OpenError};
 
     if verbose {
         match usbprint::printer_interfaces() {
@@ -72,55 +126,32 @@ fn probe(verbose: bool, io_check: bool) -> ExitCode {
         }
     }
 
-    match usbprint::find_panorama() {
-        Ok(Discovery::One(path)) => {
-            println!("Panorama SE: {path}");
-            let device = match Device::open(&path) {
-                Ok(device) => device,
-                Err(error @ OpenError::Busy(_)) => {
-                    eprintln!("{error}");
-                    return ExitCode::from(4);
-                }
-                Err(error) => {
-                    eprintln!("{error}");
-                    return ExitCode::from(1);
-                }
-            };
-            println!("opened for exclusive use");
-            if verbose {
-                match Device::open(&path) {
-                    Err(OpenError::Busy(error)) => {
-                        println!("second open refused while held: {error}");
-                    }
-                    Err(error) => println!("second open failed: {error}"),
-                    Ok(_) => println!("second open succeeded; the driver does not enforce exclusivity"),
-                }
+    let path = match win_cli::locate() {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+    let device = match win_cli::open(&path) {
+        Ok(device) => device,
+        Err(code) => return code,
+    };
+    println!("opened for exclusive use");
+    if verbose {
+        match Device::open(&path) {
+            Err(OpenError::Busy(error)) => {
+                println!("second open refused while held: {error}");
             }
-            if io_check {
-                let status = io_probe(device);
-                println!("closed");
-                return status;
-            }
-            drop(device);
-            println!("closed");
-            ExitCode::SUCCESS
-        }
-        Ok(Discovery::Absent) => {
-            eprintln!("no Panorama SE printer interface is present");
-            ExitCode::from(1)
-        }
-        Ok(Discovery::Several(paths)) => {
-            eprintln!("{} Panorama SE printer interfaces are present:", paths.len());
-            for path in &paths {
-                eprintln!("  {path}");
-            }
-            ExitCode::from(3)
-        }
-        Err(error) => {
-            eprintln!("probe failed: {error}");
-            ExitCode::from(1)
+            Err(error) => println!("second open failed: {error}"),
+            Ok(_) => println!("second open succeeded; the driver does not enforce exclusivity"),
         }
     }
+    if io_check {
+        let status = io_probe(device);
+        println!("closed");
+        return status;
+    }
+    drop(device);
+    println!("closed");
+    ExitCode::SUCCESS
 }
 
 /// Arms one input transfer, lets it time out, cancels it, and reaps it.
@@ -172,8 +203,138 @@ fn io_probe(device: ezrama::usbprint::Device) -> ExitCode {
     }
 }
 
+/// Starts a session, reads the device's information and configuration, and
+/// prints them. Sends only the read-only bootstrap and configuration queries.
+#[cfg(windows)]
+fn info() -> ExitCode {
+    use ezrama::overlapped::UsbprintTransport;
+    use ezrama::session::Session;
+    use ezrama::wire::{LoopMode, MediaMode, UserConfiguration};
+    use std::time::Instant;
+
+    let path = match win_cli::locate() {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+    let device = match win_cli::open(&path) {
+        Ok(device) => device,
+        Err(code) => return code,
+    };
+    let mut session = Session::new(UsbprintTransport::new(device));
+
+    let started = Instant::now();
+    let bootstrap = match session.bootstrap() {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            eprintln!("session start failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let elapsed = started.elapsed().as_millis();
+    let device = &bootstrap.device;
+    println!("session started in {elapsed} ms after {} DeviceInfo attempt(s)", bootstrap.readiness_attempts);
+    println!("Device");
+    println!("  product:    {}", show(&device.product_name));
+    println!("  os:         {} {}", show(&device.os_name), device.os_version);
+    println!("  firmware:   {}", show(&device.firmware_version));
+    println!("  app:        {}", show(&device.app_version));
+    println!(
+        "  serial:     {}{}",
+        show(&device.serial_number),
+        if device.serial_number_locked { " (locked)" } else { "" }
+    );
+    println!("  chip id:    {}", show(&device.chip_id));
+    println!("  auth:       {}", show(&bootstrap.auth));
+
+    let config: UserConfiguration = match session.query_user_configuration() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("configuration query failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("Configuration");
+    match &config.poweron {
+        Some(poweron) => println!("  power-on:   {}", show(&poweron.media_file)),
+        None => println!("  power-on:   not reported"),
+    }
+    match &config.standby {
+        Some(standby) => println!(
+            "  standby:    {}, media {}",
+            if standby.enable { "enabled" } else { "disabled" },
+            show(&standby.media_file)
+        ),
+        None => println!("  standby:    not reported"),
+    }
+    match &config.work {
+        Some(work) => {
+            let mode = match work.media_mode {
+                MediaMode::Single => "single".to_string(),
+                MediaMode::Dual => "dual".to_string(),
+                MediaMode::Kaleidoscope => "kaleidoscope".to_string(),
+                MediaMode::Unknown(value) => format!("unknown ({value})"),
+            };
+            let looping = match work.loop_mode {
+                LoopMode::Single => "single".to_string(),
+                LoopMode::All => "all".to_string(),
+                LoopMode::Random => "random".to_string(),
+                LoopMode::Unknown(value) => format!("unknown ({value})"),
+            };
+            println!("  work mode:  {mode}, loop {looping}");
+            println!("  single:     {}", show(&work.single_mode_media_file));
+            println!(
+                "  dual:       left {}, right {}",
+                show(&work.dual_mode_left_media_file),
+                show(&work.dual_mode_right_media_file)
+            );
+            println!(
+                "  kaleido:    {} (source {})",
+                show(&work.kaleidoscope_media_file),
+                work.kaleidoscope_source
+            );
+        }
+        None => println!("  work:       not reported"),
+    }
+    match &config.display {
+        Some(display) => {
+            println!(
+                "  backlight:  {}, brightness {}",
+                if display.backlight_enable { "on" } else { "off" },
+                display.backlight_brightness
+            );
+            println!(
+                "  rotation:   ui {}, media {}, mirror flag {}",
+                display.ui_rotation, display.media_rotation, display.mirror
+            );
+        }
+        None => println!("  display:    not reported"),
+    }
+    match session.closed_by() {
+        None => ExitCode::SUCCESS,
+        Some(error) => {
+            eprintln!("session closed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Renders a device string, making an empty one visible.
+fn show(value: &str) -> &str {
+    if value.is_empty() {
+        "(empty)"
+    } else {
+        value
+    }
+}
+
 #[cfg(not(windows))]
 fn probe(_verbose: bool, _io_check: bool) -> ExitCode {
     eprintln!("probe is only available on Windows");
+    ExitCode::from(1)
+}
+
+#[cfg(not(windows))]
+fn info() -> ExitCode {
+    eprintln!("info is only available on Windows");
     ExitCode::from(1)
 }
