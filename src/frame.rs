@@ -9,6 +9,9 @@ pub const MAGIC: [u8; 4] = *b"TRYX";
 pub const HEADER_LEN: usize = 8;
 /// Largest payload accepted in either direction.
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
+/// Most bytes a single read operation may discard while searching for a
+/// frame boundary before the stream is declared unrecoverable.
+pub const MAX_RESYNC_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameError {
@@ -16,6 +19,8 @@ pub enum FrameError {
     BadMagic,
     /// A payload length exceeds [`MAX_PAYLOAD`].
     Oversize(usize),
+    /// More than [`MAX_RESYNC_BYTES`] were discarded without finding a frame.
+    ResyncExhausted,
 }
 
 impl fmt::Display for FrameError {
@@ -25,6 +30,10 @@ impl fmt::Display for FrameError {
             FrameError::Oversize(len) => {
                 write!(f, "frame payload of {len} bytes exceeds {MAX_PAYLOAD}")
             }
+            FrameError::ResyncExhausted => write!(
+                f,
+                "response stream could not be resynchronised within {MAX_RESYNC_BYTES} bytes"
+            ),
         }
     }
 }
@@ -97,11 +106,70 @@ impl Decoder {
         self.buf.drain(..total);
         Ok(Some(payload))
     }
+
+    /// Discards bytes until the buffer starts with a plausible frame header,
+    /// is shorter than a header, or is empty. Returns how many bytes were
+    /// dropped.
+    ///
+    /// Protobuf payloads may contain the magic bytes, so a magic followed by
+    /// an implausible length is not trusted: one byte is dropped and the
+    /// search continues.
+    pub fn resync(&mut self) -> usize {
+        let mut discarded = 0;
+        while !self.buf.is_empty() {
+            discarded += discard_before_magic(&mut self.buf);
+            if self.buf.len() < HEADER_LEN {
+                break;
+            }
+            if payload_len(&self.buf) <= MAX_PAYLOAD {
+                break;
+            }
+            self.buf.drain(..1);
+            discarded += 1;
+        }
+        discarded
+    }
+
+    /// Resynchronises, adds the dropped bytes to `discarded`, and then takes
+    /// the next frame. Once `discarded` passes [`MAX_RESYNC_BYTES`] the
+    /// buffer is emptied and [`FrameError::ResyncExhausted`] is returned.
+    ///
+    /// The caller keeps `discarded` for the lifetime of one read operation.
+    pub fn resync_and_take_frame(
+        &mut self,
+        discarded: &mut usize,
+    ) -> Result<Option<Vec<u8>>, FrameError> {
+        *discarded += self.resync();
+        if *discarded > MAX_RESYNC_BYTES {
+            self.buf.clear();
+            return Err(FrameError::ResyncExhausted);
+        }
+        self.take_frame()
+    }
 }
 
 /// Reads the payload length from a buffer that holds at least a full header.
 fn payload_len(header: &[u8]) -> usize {
     u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize
+}
+
+/// Drops bytes before the first magic. When no magic is present, keeps only
+/// a trailing partial magic so a boundary split across reads still matches.
+fn discard_before_magic(buf: &mut Vec<u8>) -> usize {
+    if buf.is_empty() || buf.starts_with(&MAGIC) {
+        return 0;
+    }
+    if let Some(index) = buf.windows(MAGIC.len()).position(|w| w == MAGIC) {
+        buf.drain(..index);
+        return index;
+    }
+    let mut keep = (MAGIC.len() - 1).min(buf.len());
+    while keep > 0 && buf[buf.len() - keep..] != MAGIC[..keep] {
+        keep -= 1;
+    }
+    let discarded = buf.len() - keep;
+    buf.drain(..discarded);
+    discarded
 }
 
 #[cfg(test)]
@@ -199,5 +267,120 @@ mod tests {
         decoder.clear();
         assert_eq!(decoder.buffered(), 0);
         assert_eq!(decoder.take_frame(), Ok(None));
+    }
+
+    #[test]
+    fn resync_leaves_clean_input_alone() {
+        let mut decoder = Decoder::new();
+        assert_eq!(decoder.resync(), 0);
+        decoder.push(&encode(b"ok").unwrap());
+        assert_eq!(decoder.resync(), 0);
+        assert_eq!(decoder.take_frame(), Ok(Some(b"ok".to_vec())));
+    }
+
+    #[test]
+    fn resync_drops_garbage_before_magic() {
+        let mut decoder = Decoder::new();
+        decoder.push(b"junk");
+        decoder.push(&encode(b"ab").unwrap());
+        assert_eq!(decoder.resync(), 4);
+        assert_eq!(decoder.take_frame(), Ok(Some(b"ab".to_vec())));
+    }
+
+    #[test]
+    fn resync_keeps_partial_magic_at_end_of_read() {
+        let mut decoder = Decoder::new();
+        decoder.push(b"abcTR");
+        assert_eq!(decoder.resync(), 3);
+        assert_eq!(decoder.buffered(), 2);
+        decoder.push(b"YX\x01\x00\x00\x00z");
+        assert_eq!(decoder.resync(), 0);
+        assert_eq!(decoder.take_frame(), Ok(Some(b"z".to_vec())));
+    }
+
+    #[test]
+    fn resync_drops_everything_when_no_magic_prefix_remains() {
+        let mut decoder = Decoder::new();
+        decoder.push(b"hello");
+        assert_eq!(decoder.resync(), 5);
+        assert_eq!(decoder.buffered(), 0);
+    }
+
+    #[test]
+    fn resync_skips_magic_with_implausible_length() {
+        let mut decoder = Decoder::new();
+        decoder.push(b"TRYX\xff\xff\xff\xff");
+        decoder.push(&encode(b"q").unwrap());
+        assert_eq!(decoder.resync(), 8);
+        assert_eq!(decoder.take_frame(), Ok(Some(b"q".to_vec())));
+    }
+
+    #[test]
+    fn resync_waits_for_a_full_header_before_judging_length() {
+        let mut decoder = Decoder::new();
+        decoder.push(b"xTRYX\xff\xff");
+        assert_eq!(decoder.resync(), 1);
+        assert_eq!(decoder.buffered(), 6);
+        assert_eq!(decoder.take_frame(), Ok(None));
+    }
+
+    #[test]
+    fn resync_and_take_frame_counts_across_calls() {
+        let mut decoder = Decoder::new();
+        let mut discarded = 0;
+        decoder.push(b"ab");
+        assert_eq!(decoder.resync_and_take_frame(&mut discarded), Ok(None));
+        assert_eq!(discarded, 2);
+        decoder.push(b"cd");
+        decoder.push(&encode(b"p").unwrap());
+        assert_eq!(
+            decoder.resync_and_take_frame(&mut discarded),
+            Ok(Some(b"p".to_vec()))
+        );
+        assert_eq!(discarded, 4);
+    }
+
+    #[test]
+    fn resync_budget_boundary() {
+        let mut decoder = Decoder::new();
+        let mut discarded = 0;
+        decoder.push(&vec![b'z'; MAX_RESYNC_BYTES]);
+        assert_eq!(decoder.resync_and_take_frame(&mut discarded), Ok(None));
+        assert_eq!(discarded, MAX_RESYNC_BYTES);
+        decoder.push(b"z");
+        decoder.push(&encode(b"late").unwrap());
+        assert_eq!(
+            decoder.resync_and_take_frame(&mut discarded),
+            Err(FrameError::ResyncExhausted)
+        );
+        assert_eq!(decoder.buffered(), 0);
+    }
+
+    #[test]
+    fn resync_budget_exceeded_in_one_read() {
+        let mut decoder = Decoder::new();
+        let mut discarded = 0;
+        decoder.push(&vec![0u8; MAX_RESYNC_BYTES + 1]);
+        assert_eq!(
+            decoder.resync_and_take_frame(&mut discarded),
+            Err(FrameError::ResyncExhausted)
+        );
+        assert_eq!(decoder.buffered(), 0);
+    }
+
+    #[test]
+    fn take_frame_never_sees_bad_magic_after_resync() {
+        let inputs: [&[u8]; 4] = [
+            b"garbage",
+            b"TRYX\xff\xff\xff\xff\x00",
+            b"..TRYX\x00\x00\x10\x00TRYX",
+            b"TRY",
+        ];
+        for input in inputs {
+            let mut decoder = Decoder::new();
+            decoder.push(input);
+            decoder.resync();
+            assert_ne!(decoder.take_frame(), Err(FrameError::BadMagic));
+        }
     }
 }
