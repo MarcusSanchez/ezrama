@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::install::read_string;
+use crate::overlapped::wait_millis;
 use crate::usbprint::{wide, WinError};
 use crate::win::*;
 
@@ -33,6 +34,15 @@ pub struct Process {
 unsafe impl Send for Process {}
 
 impl Process {
+    /// Opens a running process for waiting only.
+    pub fn open(id: u32) -> Result<Self, WinError> {
+        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, id) };
+        if handle.is_null() {
+            return Err(WinError::last("OpenProcess"));
+        }
+        Ok(Self { handle, id })
+    }
+
     pub fn id(&self) -> u32 {
         self.id
     }
@@ -42,6 +52,11 @@ impl Process {
         unsafe {
             WaitForSingleObject(self.handle, INFINITE);
         }
+    }
+
+    /// Waits up to `timeout` for the process to exit; false on timeout.
+    pub fn wait_for(&self, timeout: Duration) -> bool {
+        unsafe { WaitForSingleObject(self.handle, wait_millis(timeout)) == WAIT_OBJECT_0 }
     }
 }
 
@@ -210,6 +225,10 @@ mod tests {
         let process = start_detached(&system.join("cmd.exe"), "/c exit 0", Some(&system)).unwrap();
         assert_ne!(process.id(), 0);
         process.wait();
+        assert!(process.wait_for(Duration::ZERO));
+        let own = Process::open(std::process::id()).unwrap();
+        assert!(!own.wait_for(Duration::ZERO));
+        assert!(Process::open(0).is_err());
         let missing = start_detached(Path::new(r"C:\ezrama-no-such-program.exe"), "", None);
         assert_eq!(missing.err().map(|error| error.code), Some(ERROR_FILE_NOT_FOUND));
     }

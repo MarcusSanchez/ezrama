@@ -150,6 +150,21 @@ pub fn find_watcher() -> Option<HWND> {
     }
 }
 
+/// The id of the process owning `window`, or zero if it is gone.
+fn process_id(window: HWND) -> u32 {
+    let mut id: DWORD = 0;
+    unsafe {
+        GetWindowThreadProcessId(window, &mut id);
+    }
+    id
+}
+
+/// The process id of whichever watcher is running in this desktop session.
+pub fn watcher_process_id() -> Option<u32> {
+    let id = process_id(find_watcher()?);
+    (id != 0).then_some(id)
+}
+
 /// Sends a request to whichever watcher is running in this desktop
 /// session. Returns false when there is none.
 pub fn control_watcher(request: Request) -> bool {
@@ -593,6 +608,8 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(!local_window().is_null(), "the message loop did not create its window");
+        assert_eq!(process_id(local_window()), std::process::id());
+        assert_eq!(process_id(ptr::null_mut()), 0);
 
         set_state(State::Connecting);
         assert_eq!(query_state(local_window()), Some(State::Connecting));

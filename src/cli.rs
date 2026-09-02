@@ -39,6 +39,9 @@ const EXIT_BUSY: u8 = 4;
 const EXIT_SEVERAL: u8 = 3;
 /// How long `pause` waits for the watcher to confirm the release.
 const PAUSE_CONFIRMATION: Duration = Duration::from_secs(5);
+/// How long `install` and `uninstall` wait for a stopped watcher to exit;
+/// a session start attempt can hold it for the readiness deadline.
+const STOP_CONFIRMATION: Duration = Duration::from_secs(30);
 
 /// A request for a running watcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -903,20 +906,35 @@ fn control(_request: WatcherRequest) -> ExitCode {
     unsupported("watcher control")
 }
 
-/// Asks a running watcher to stop and waits for its window to go away.
-/// Returns whether one was running.
+/// Asks a running watcher to stop and waits for its process to exit, which
+/// can take a while when it is inside a session start attempt. Returns
+/// whether one was running.
 #[cfg(windows)]
 fn stop_watcher_and_wait() -> bool {
+    use crate::launcher::Process;
     use crate::window::{self, Request};
     use std::time::Instant;
 
-    if window::find_watcher().is_none() {
+    let Some(id) = window::watcher_process_id() else {
         return false;
-    }
+    };
+    let process = Process::open(id).ok();
     window::control_watcher(Request::Stop);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while window::find_watcher().is_some() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
+    match process {
+        Some(process) => {
+            if !process.wait_for(STOP_CONFIRMATION) {
+                eprintln!(
+                    "the watcher has not exited within {} s",
+                    STOP_CONFIRMATION.as_secs()
+                );
+            }
+        }
+        None => {
+            let deadline = Instant::now() + STOP_CONFIRMATION;
+            while window::find_watcher().is_some() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
     true
 }

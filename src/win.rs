@@ -211,6 +211,7 @@ extern "system" {
         lpszClass: *const u16,
         lpszWindow: *const u16,
     ) -> HWND;
+    pub fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut DWORD) -> DWORD;
 }
 
 pub const DIGCF_PRESENT: DWORD = 0x0000_0002;
