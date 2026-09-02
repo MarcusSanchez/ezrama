@@ -64,6 +64,55 @@ pub const EVENT_MODIFY_STATE: DWORD = 0x0002;
 pub const SYNCHRONIZE: DWORD = 0x0010_0000;
 pub const ERROR_ALREADY_EXISTS: DWORD = 183;
 
+pub type HKEY = *mut c_void;
+pub type LSTATUS = i32;
+
+pub const HKEY_CURRENT_USER: HKEY = 0x8000_0001usize as HKEY;
+pub const KEY_QUERY_VALUE: DWORD = 0x0001;
+pub const KEY_SET_VALUE: DWORD = 0x0002;
+pub const REG_SZ: DWORD = 1;
+pub const ERROR_SUCCESS: LSTATUS = 0;
+pub const ERROR_MORE_DATA: LSTATUS = 234;
+
+#[link(name = "advapi32")]
+extern "system" {
+    pub fn RegOpenKeyExW(
+        hKey: HKEY,
+        lpSubKey: *const u16,
+        ulOptions: DWORD,
+        samDesired: DWORD,
+        phkResult: *mut HKEY,
+    ) -> LSTATUS;
+    pub fn RegCloseKey(hKey: HKEY) -> LSTATUS;
+    pub fn RegQueryValueExW(
+        hKey: HKEY,
+        lpValueName: *const u16,
+        lpReserved: *mut DWORD,
+        lpType: *mut DWORD,
+        lpData: *mut u8,
+        lpcbData: *mut DWORD,
+    ) -> LSTATUS;
+    pub fn RegSetValueExW(
+        hKey: HKEY,
+        lpValueName: *const u16,
+        Reserved: DWORD,
+        dwType: DWORD,
+        lpData: *const u8,
+        cbData: DWORD,
+    ) -> LSTATUS;
+    pub fn RegDeleteValueW(hKey: HKEY, lpValueName: *const u16) -> LSTATUS;
+    pub fn RegEnumValueW(
+        hKey: HKEY,
+        dwIndex: DWORD,
+        lpValueName: *mut u16,
+        lpcchValueName: *mut DWORD,
+        lpReserved: *mut DWORD,
+        lpType: *mut DWORD,
+        lpData: *mut u8,
+        lpcbData: *mut DWORD,
+    ) -> LSTATUS;
+}
+
 #[repr(C)]
 pub struct WNDCLASSW {
     pub style: u32,

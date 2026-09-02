@@ -11,6 +11,8 @@ pub mod wire;
 #[cfg(windows)]
 pub mod devnotify;
 #[cfg(windows)]
+pub mod install;
+#[cfg(windows)]
 pub mod overlapped;
 #[cfg(windows)]
 pub mod usbprint;

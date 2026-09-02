@@ -18,6 +18,9 @@ Commands:
   pause      Ask the running watcher to release the panel and wait for it
   resume     Ask the running watcher to take the panel back
   stop       Ask the running watcher to exit
+  install    Copy the binaries to local app data, start the watcher at logon
+  uninstall  Stop the watcher and remove the logon entry and the binaries
+  status     Report the installation, the watcher, and the panel
   help       Show this message
   version    Print the version
 
@@ -75,6 +78,9 @@ fn dispatch(args: &[String]) -> ExitCode {
         Some("pause") => control(WatcherRequest::Pause),
         Some("resume") => control(WatcherRequest::Resume),
         Some("stop") => control(WatcherRequest::Stop),
+        Some("install") => install(),
+        Some("uninstall") => uninstall(),
+        Some("status") => status(),
         Some("version") => {
             println!("{NAME} {VERSION}");
             ExitCode::SUCCESS
@@ -817,6 +823,225 @@ fn watch(_verbose: bool, _interval: Duration) -> ExitCode {
 #[cfg(not(windows))]
 fn control(_request: WatcherRequest) -> ExitCode {
     unsupported("watcher control")
+}
+
+/// Asks a running watcher to stop and waits for its window to go away.
+/// Returns whether one was running.
+#[cfg(windows)]
+fn stop_watcher_and_wait() -> bool {
+    use crate::devnotify::{self, Request};
+    use std::time::Instant;
+
+    if devnotify::find_watcher().is_none() {
+        return false;
+    }
+    devnotify::control_watcher(Request::Stop);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while devnotify::find_watcher().is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+/// Starts the windowless watcher at `watcher`, detached from this process.
+#[cfg(windows)]
+fn spawn_watcher(watcher: &std::path::Path) -> std::io::Result<u32> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let child = Command::new(watcher)
+        .arg("watch")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS)
+        .spawn()?;
+    Ok(child.id())
+}
+
+/// Copies the binaries next to the log, registers the logon entry, and
+/// starts the installed watcher.
+#[cfg(windows)]
+fn install() -> ExitCode {
+    use crate::install::*;
+
+    let Some(directory) = install_dir() else {
+        eprintln!("LOCALAPPDATA is not set; cannot choose an installation directory");
+        return ExitCode::from(1);
+    };
+    let source_dir = match std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        Some(dir) => dir,
+        None => {
+            eprintln!("cannot locate this program's own directory");
+            return ExitCode::from(1);
+        }
+    };
+    let installed_console = directory.join(CONSOLE_BINARY);
+    let installed_watcher = directory.join(WATCHER_BINARY);
+
+    if stop_watcher_and_wait() {
+        println!("stopped the running watcher");
+    }
+
+    if source_dir != directory {
+        for name in [CONSOLE_BINARY, WATCHER_BINARY] {
+            let source = source_dir.join(name);
+            let destination = directory.join(name);
+            match copy_binary(&source, &destination) {
+                Ok(bytes) => println!("copied {name} to {} ({bytes} bytes)", directory.display()),
+                Err(error) => {
+                    eprintln!("cannot copy {} to {}: {error}", source.display(), destination.display());
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    } else {
+        println!("already running from {}", directory.display());
+    }
+
+    let command = run_command(&installed_watcher);
+    if let Err(error) = set_run_value(RUN_VALUE, &command) {
+        eprintln!("cannot register the logon entry: {error}");
+        return ExitCode::from(1);
+    }
+    println!("logon entry {RUN_VALUE}: {command}");
+
+    match kanali_run_entries() {
+        Ok(entries) if !entries.is_empty() => {
+            for entry in &entries {
+                println!(
+                    "note: a KANALI startup entry named {} is still enabled: {}",
+                    entry.name, entry.command
+                );
+            }
+            println!("      disable it in Task Manager under Startup apps, or the two will race for the panel at logon");
+        }
+        Ok(_) => {}
+        Err(error) => println!("could not check for KANALI startup entries: {error}"),
+    }
+
+    match spawn_watcher(&installed_watcher) {
+        Ok(pid) => println!("started the installed watcher (process {pid})"),
+        Err(error) => {
+            eprintln!("installed, but could not start the watcher now: {error}");
+            return ExitCode::from(1);
+        }
+    }
+    let _ = installed_console;
+    ExitCode::SUCCESS
+}
+
+/// Stops the watcher, removes the logon entry, and deletes the installed
+/// binaries. The log file is left in place.
+#[cfg(windows)]
+fn uninstall() -> ExitCode {
+    use crate::install::*;
+    use crate::log::default_log_path;
+
+    if stop_watcher_and_wait() {
+        println!("stopped the running watcher");
+    }
+    match delete_run_value(RUN_VALUE) {
+        Ok(true) => println!("removed the logon entry"),
+        Ok(false) => println!("no logon entry was registered"),
+        Err(error) => {
+            eprintln!("cannot remove the logon entry: {error}");
+            return ExitCode::from(1);
+        }
+    }
+    let Some(directory) = install_dir() else {
+        eprintln!("LOCALAPPDATA is not set; nothing to delete");
+        return ExitCode::from(1);
+    };
+    let mut failed = false;
+    for name in [CONSOLE_BINARY, WATCHER_BINARY] {
+        let path = directory.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("deleted {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!("cannot delete {}: {error}", path.display());
+                failed = true;
+            }
+        }
+    }
+    if let Some(log) = default_log_path() {
+        if log.exists() {
+            println!("log kept at {}", log.display());
+        }
+    }
+    if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Reports the installation, the watcher, and the panel.
+#[cfg(windows)]
+fn status() -> ExitCode {
+    use crate::devnotify;
+    use crate::install::*;
+    use crate::usbprint::{self, Discovery};
+
+    match install_dir() {
+        Some(directory) => {
+            for name in [CONSOLE_BINARY, WATCHER_BINARY] {
+                let path = directory.join(name);
+                println!(
+                    "{name:<12} {}",
+                    if path.exists() { format!("installed at {}", path.display()) } else { "not installed".to_string() }
+                );
+            }
+        }
+        None => println!("install dir  unknown (LOCALAPPDATA is not set)"),
+    }
+    match read_run_value(RUN_VALUE) {
+        Ok(Some(command)) => println!("logon entry  {command}"),
+        Ok(None) => println!("logon entry  none"),
+        Err(error) => println!("logon entry  unreadable: {error}"),
+    }
+    match kanali_run_entries() {
+        Ok(entries) if entries.is_empty() => println!("kanali       no startup entry"),
+        Ok(entries) => {
+            for entry in entries {
+                println!("kanali       startup entry {}: {}", entry.name, entry.command);
+            }
+        }
+        Err(error) => println!("kanali       unreadable: {error}"),
+    }
+    let watcher = match devnotify::find_watcher() {
+        None => "not running".to_string(),
+        Some(_) => match devnotify::wait_paused(Duration::ZERO) {
+            Ok(true) => "running, paused".to_string(),
+            Ok(false) => "running, holding".to_string(),
+            Err(_) => "running".to_string(),
+        },
+    };
+    println!("watcher      {watcher}");
+    match usbprint::find_panorama() {
+        Ok(Discovery::One(path)) => println!("panel        present at {path}"),
+        Ok(Discovery::Absent) => println!("panel        not present"),
+        Ok(Discovery::Several(paths)) => println!("panel        {} present", paths.len()),
+        Err(error) => println!("panel        discovery failed: {error}"),
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(windows))]
+fn install() -> ExitCode {
+    unsupported("install")
+}
+
+#[cfg(not(windows))]
+fn uninstall() -> ExitCode {
+    unsupported("uninstall")
+}
+
+#[cfg(not(windows))]
+fn status() -> ExitCode {
+    unsupported("status")
 }
 
 #[cfg(not(windows))]
