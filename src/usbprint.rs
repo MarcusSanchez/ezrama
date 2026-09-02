@@ -23,7 +23,7 @@ pub struct WinError {
 }
 
 impl WinError {
-    fn last(call: &'static str) -> Self {
+    pub(crate) fn last(call: &'static str) -> Self {
         let code = unsafe { GetLastError() };
         Self { call, code }
     }

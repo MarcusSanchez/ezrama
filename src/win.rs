@@ -15,11 +15,23 @@ pub const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
 pub const ERROR_FILE_NOT_FOUND: DWORD = 2;
 pub const ERROR_PATH_NOT_FOUND: DWORD = 3;
 pub const ERROR_ACCESS_DENIED: DWORD = 5;
+pub const ERROR_INVALID_HANDLE: DWORD = 6;
+pub const ERROR_BAD_UNIT: DWORD = 20;
 pub const ERROR_GEN_FAILURE: DWORD = 31;
 pub const ERROR_SHARING_VIOLATION: DWORD = 32;
 pub const ERROR_INSUFFICIENT_BUFFER: DWORD = 122;
 pub const ERROR_NO_MORE_ITEMS: DWORD = 259;
+pub const ERROR_NO_SUCH_DEVICE: DWORD = 433;
+pub const ERROR_OPERATION_ABORTED: DWORD = 995;
+pub const ERROR_IO_INCOMPLETE: DWORD = 996;
+pub const ERROR_IO_PENDING: DWORD = 997;
 pub const ERROR_DEVICE_NOT_CONNECTED: DWORD = 1167;
+pub const ERROR_NOT_FOUND: DWORD = 1168;
+pub const ERROR_DEVICE_REMOVED: DWORD = 1617;
+
+pub const WAIT_OBJECT_0: DWORD = 0;
+pub const WAIT_TIMEOUT: DWORD = 258;
+pub const WAIT_FAILED: DWORD = 0xffff_ffff;
 
 pub const DIGCF_PRESENT: DWORD = 0x0000_0002;
 pub const DIGCF_DEVICEINTERFACE: DWORD = 0x0000_0010;
@@ -55,6 +67,15 @@ pub struct SP_DEVICE_INTERFACE_DATA {
     pub InterfaceClassGuid: GUID,
     pub Flags: DWORD,
     pub Reserved: usize,
+}
+
+#[repr(C)]
+pub struct OVERLAPPED {
+    pub Internal: usize,
+    pub InternalHigh: usize,
+    pub Offset: DWORD,
+    pub OffsetHigh: DWORD,
+    pub hEvent: HANDLE,
 }
 
 /// `cbSize` of `SP_DEVICE_INTERFACE_DETAIL_DATA_W` on 64-bit Windows: the
@@ -111,4 +132,32 @@ extern "system" {
         hTemplateFile: HANDLE,
     ) -> HANDLE;
     pub fn CloseHandle(hObject: HANDLE) -> BOOL;
+    pub fn CreateEventW(
+        lpEventAttributes: *mut c_void,
+        bManualReset: BOOL,
+        bInitialState: BOOL,
+        lpName: *const u16,
+    ) -> HANDLE;
+    pub fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
+    pub fn ReadFile(
+        hFile: HANDLE,
+        lpBuffer: *mut c_void,
+        nNumberOfBytesToRead: DWORD,
+        lpNumberOfBytesRead: *mut DWORD,
+        lpOverlapped: *mut OVERLAPPED,
+    ) -> BOOL;
+    pub fn WriteFile(
+        hFile: HANDLE,
+        lpBuffer: *const c_void,
+        nNumberOfBytesToWrite: DWORD,
+        lpNumberOfBytesWritten: *mut DWORD,
+        lpOverlapped: *mut OVERLAPPED,
+    ) -> BOOL;
+    pub fn CancelIoEx(hFile: HANDLE, lpOverlapped: *mut OVERLAPPED) -> BOOL;
+    pub fn GetOverlappedResult(
+        hFile: HANDLE,
+        lpOverlapped: *mut OVERLAPPED,
+        lpNumberOfBytesTransferred: *mut DWORD,
+        bWait: BOOL,
+    ) -> BOOL;
 }
