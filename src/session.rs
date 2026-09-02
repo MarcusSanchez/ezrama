@@ -1,15 +1,18 @@
 //! The device session: framed exchange over a transport.
 //!
 //! The session fails closed. Once a malformed stream, an exhausted budget,
-//! or a lost transport has been seen, every further call returns
-//! [`SessionError::Closed`] and a new session must be started on a fresh
-//! transport.
+//! a rejected exchange, or a lost transport has been seen, every further
+//! call returns [`SessionError::Closed`] and a new session must be started
+//! on a fresh transport.
 
 use std::fmt;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::frame::{Decoder, FrameError};
+use crate::frame::{self, Decoder, FrameError};
+use crate::pb::DecodeError;
 use crate::transport::{ReadError, Transport, WriteError};
+use crate::wire::{self, field, DeviceInformation, ProtocolError, Response};
 
 /// Unrelated complete frames tolerated while waiting for a match.
 pub const MAX_SKIPPED_FRAMES: usize = 256;
@@ -17,6 +20,37 @@ pub const MAX_SKIPPED_FRAMES: usize = 256;
 pub const MAX_SKIPPED_BYTES: usize = 4 * 1024 * 1024;
 /// How long a drain waits for stragglers.
 pub const DRAIN_WINDOW: Duration = Duration::from_millis(250);
+/// How long a matching response may take.
+pub const TRANSACTION_TIMEOUT: Duration = Duration::from_millis(3000);
+/// How long a bootstrap request may take to transfer.
+pub const BOOTSTRAP_WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
+/// How long the device may take to answer its first DeviceInfo request
+/// after enumeration.
+pub const READINESS_DEADLINE: Duration = Duration::from_millis(20_000);
+/// First pause after a DeviceInfo write that transferred nothing.
+pub const READINESS_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+/// Longest pause between DeviceInfo attempts.
+pub const READINESS_MAX_BACKOFF: Duration = Duration::from_millis(2000);
+
+/// Time source for deadlines and backoff, replaceable in tests.
+pub trait Clock {
+    fn now(&mut self) -> Instant;
+    fn sleep(&mut self, duration: Duration);
+}
+
+/// The real clock.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
@@ -28,8 +62,21 @@ pub enum SessionError {
     Write(WriteError),
     /// The byte stream could not be framed.
     Frame(FrameError),
+    /// A response payload was not a valid message.
+    Decode(DecodeError),
     /// Too many unrelated frames arrived while waiting for a match.
     TooManySkipped,
+    /// No matching response arrived before the deadline.
+    Timeout,
+    /// A response carried a header the exchange does not accept.
+    UnexpectedHeader,
+    /// The device answered with an error.
+    Rejected(ProtocolError),
+    /// The matching response carried the wrong body.
+    UnexpectedBody { expected: u32, actual: Option<u32> },
+    /// The device never accepted a DeviceInfo request within the readiness
+    /// deadline.
+    NotReady { attempts: u32 },
 }
 
 impl fmt::Display for SessionError {
@@ -39,8 +86,25 @@ impl fmt::Display for SessionError {
             SessionError::Read(error) => write!(f, "{error}"),
             SessionError::Write(error) => write!(f, "{error}"),
             SessionError::Frame(error) => write!(f, "{error}"),
+            SessionError::Decode(error) => write!(f, "{error}"),
             SessionError::TooManySkipped => {
                 write!(f, "too many unrelated response frames")
+            }
+            SessionError::Timeout => write!(f, "timed out waiting for the matching response"),
+            SessionError::UnexpectedHeader => write!(f, "response has an unexpected header"),
+            SessionError::Rejected(error) => {
+                if error.why.is_empty() {
+                    write!(f, "device rejected the request with error {}", error.code)
+                } else {
+                    write!(f, "device rejected the request: {}", error.why)
+                }
+            }
+            SessionError::UnexpectedBody { expected, actual } => match actual {
+                Some(actual) => write!(f, "response body {actual} does not match expected {expected}"),
+                None => write!(f, "response has no body; expected {expected}"),
+            },
+            SessionError::NotReady { attempts } => {
+                write!(f, "device did not become ready after {attempts} attempts")
             }
         }
     }
@@ -60,9 +124,18 @@ impl SkipBudget {
     /// whether the budget still allows waiting.
     pub fn skip(&mut self, payload_len: usize) -> bool {
         self.frames += 1;
-        self.bytes += payload_len + crate::frame::HEADER_LEN;
+        self.bytes += payload_len + frame::HEADER_LEN;
         self.frames <= MAX_SKIPPED_FRAMES && self.bytes <= MAX_SKIPPED_BYTES
     }
+}
+
+/// What the bootstrap learned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bootstrap {
+    pub device: DeviceInformation,
+    pub auth: String,
+    /// DeviceInfo writes made before the device answered.
+    pub readiness_attempts: u32,
 }
 
 /// A framed session over one transport.
@@ -70,14 +143,20 @@ pub struct Session<T: Transport> {
     transport: T,
     decoder: Decoder,
     closed: Option<SessionError>,
+    clock: Box<dyn Clock + Send>,
 }
 
 impl<T: Transport> Session<T> {
     pub fn new(transport: T) -> Self {
+        Self::with_clock(transport, Box::new(SystemClock))
+    }
+
+    pub fn with_clock(transport: T, clock: Box<dyn Clock + Send>) -> Self {
         Self {
             transport,
             decoder: Decoder::new(),
             closed: None,
+            clock,
         }
     }
 
@@ -131,7 +210,7 @@ impl<T: Transport> Session<T> {
                 Ok(None) => {}
                 Err(error) => return Err(self.close(SessionError::Frame(error))),
             }
-            let now = Instant::now();
+            let now = self.clock.now();
             if now >= deadline {
                 return Ok(None);
             }
@@ -140,17 +219,15 @@ impl<T: Transport> Session<T> {
                 Err(error) => return Err(self.close(SessionError::Read(error))),
             };
             if bytes.is_empty() {
-                if Instant::now() >= deadline {
-                    return Ok(None);
-                }
-                continue;
+                return Ok(None);
             }
             self.decoder.push(&bytes);
         }
     }
 
-    /// Writes one frame's bytes. A lost transport closes the session; other
-    /// write failures are returned for the caller to classify.
+    /// Writes one frame's bytes. A lost transport or an unknown outcome
+    /// closes the session; other write failures are returned for the caller
+    /// to classify.
     pub fn write_bytes(&mut self, bytes: &[u8], timeout: Duration) -> Result<(), SessionError> {
         self.ensure_open()?;
         match self.transport.write(bytes, timeout) {
@@ -168,7 +245,7 @@ impl<T: Transport> Session<T> {
     /// from a clean stream. The skip budget bounds how much may be drained.
     pub fn drain(&mut self, window: Duration) -> Result<Vec<Vec<u8>>, SessionError> {
         self.ensure_open()?;
-        let deadline = Instant::now() + window;
+        let deadline = self.clock.now() + window;
         let mut discarded = 0;
         let mut budget = SkipBudget::default();
         let mut drained = Vec::new();
@@ -181,13 +258,161 @@ impl<T: Transport> Session<T> {
         self.decoder.clear();
         Ok(drained)
     }
+
+    /// Runs the three untracked exchanges that open a display session:
+    /// DeviceInfo, SystemConfiguration, and DeviceAuth.
+    ///
+    /// Only the DeviceInfo write is retried, and only when it transferred
+    /// nothing before its timeout, with backoff inside the readiness
+    /// deadline. Any other failure closes the session.
+    pub fn bootstrap(&mut self) -> Result<Bootstrap, SessionError> {
+        self.ensure_open()?;
+        self.drain(DRAIN_WINDOW)?;
+
+        let probe = framed(&wire::device_information_query())?;
+        let started = self.clock.now();
+        let mut attempts = 0u32;
+        let mut backoff = READINESS_INITIAL_BACKOFF;
+        let mut device_body = None;
+        loop {
+            let elapsed = self.clock.now().saturating_duration_since(started);
+            if elapsed >= READINESS_DEADLINE {
+                break;
+            }
+            attempts += 1;
+            let remaining = READINESS_DEADLINE - elapsed;
+            let write_timeout = TRANSACTION_TIMEOUT
+                .min(BOOTSTRAP_WRITE_TIMEOUT)
+                .min(remaining.max(Duration::from_millis(1)));
+            match self.write_bytes(&probe, write_timeout) {
+                Ok(()) => {}
+                Err(SessionError::Write(WriteError::TimedOut)) => {
+                    let elapsed = self.clock.now().saturating_duration_since(started);
+                    let remaining = READINESS_DEADLINE.saturating_sub(elapsed);
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    self.clock.sleep(backoff.min(remaining));
+                    backoff = (backoff * 2).min(READINESS_MAX_BACKOFF);
+                    continue;
+                }
+                Err(error) => return Err(self.close(error)),
+            }
+
+            let elapsed = self.clock.now().saturating_duration_since(started);
+            let budget = READINESS_DEADLINE.saturating_sub(elapsed);
+            if budget.is_zero() {
+                return Err(self.close(SessionError::Timeout));
+            }
+            let deadline = self.clock.now() + budget;
+            device_body = Some(self.read_bootstrap_response(field::DEVICE_INFORMATION, deadline)?);
+            break;
+        }
+        let Some(device_body) = device_body else {
+            return Err(self.close(SessionError::NotReady { attempts }));
+        };
+        let device = match DeviceInformation::parse(&device_body) {
+            Ok(device) => device,
+            Err(error) => return Err(self.close(SessionError::Decode(error))),
+        };
+
+        self.bootstrap_exchange(
+            &wire::system_configuration_query(),
+            field::SYSTEM_CONFIGURATION,
+        )?;
+        let auth_body = self.bootstrap_exchange(
+            &wire::device_authentication_query(),
+            field::DEVICE_AUTHENTICATION,
+        )?;
+        let auth = match wire::parse_device_authentication(&auth_body) {
+            Ok(auth) => auth,
+            Err(error) => return Err(self.close(SessionError::Decode(error))),
+        };
+
+        Ok(Bootstrap {
+            device,
+            auth,
+            readiness_attempts: attempts,
+        })
+    }
+
+    /// One untracked exchange sent exactly once: drain, write, and wait for
+    /// the exact response body. Any failure closes the session.
+    fn bootstrap_exchange(&mut self, payload: &[u8], expected_body: u32) -> Result<Vec<u8>, SessionError> {
+        self.drain(DRAIN_WINDOW)?;
+        let frame = framed(payload)?;
+        if let Err(error) = self.write_bytes(&frame, TRANSACTION_TIMEOUT.min(BOOTSTRAP_WRITE_TIMEOUT)) {
+            return Err(self.close(error));
+        }
+        let deadline = self.clock.now() + TRANSACTION_TIMEOUT;
+        self.read_bootstrap_response(expected_body, deadline)
+    }
+
+    /// Waits for a bootstrap response carrying `expected_body`.
+    ///
+    /// Accepted headers carry version 1, track id 0, and crc 0. Frames with
+    /// a stale tracked header, and header-less Pong or event frames, are
+    /// skipped within the budget. Anything else, a device error, or a
+    /// different body closes the session.
+    fn read_bootstrap_response(&mut self, expected_body: u32, deadline: Instant) -> Result<Vec<u8>, SessionError> {
+        let mut discarded = 0;
+        let mut budget = SkipBudget::default();
+        loop {
+            let Some(payload) = self.read_frame(deadline, &mut discarded)? else {
+                return Err(self.close(SessionError::Timeout));
+            };
+            let response = match Response::parse(&payload) {
+                Ok(response) => response,
+                Err(error) => return Err(self.close(SessionError::Decode(error))),
+            };
+            let expected_header = matches!(
+                response.header,
+                Some(header) if header.version == 1 && header.track_id == 0 && header.payload_crc32 == 0
+            );
+            let stale_tracked = matches!(
+                response.header,
+                Some(header) if header.version == 1 && header.track_id != 0 && header.payload_crc32 == 0
+            );
+            let headerless_async = response.header.is_none()
+                && matches!(
+                    response.body_number(),
+                    Some(field::PONG) | Some(field::ASYNCHRONOUS_EVENT)
+                );
+            if stale_tracked || headerless_async {
+                if !budget.skip(payload.len()) {
+                    return Err(self.close(SessionError::TooManySkipped));
+                }
+                continue;
+            }
+            if !expected_header {
+                return Err(self.close(SessionError::UnexpectedHeader));
+            }
+            if let Some(rejection) = response.rejection() {
+                let rejection = rejection.clone();
+                return Err(self.close(SessionError::Rejected(rejection)));
+            }
+            return match response.body {
+                Some((number, body)) if number == expected_body => Ok(body.to_vec()),
+                other => Err(self.close(SessionError::UnexpectedBody {
+                    expected: expected_body,
+                    actual: other.map(|(number, _)| number),
+                })),
+            };
+        }
+    }
+}
+
+fn framed(payload: &[u8]) -> Result<Vec<u8>, SessionError> {
+    frame::encode(payload).map_err(SessionError::Frame)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::frame::{encode, MAX_RESYNC_BYTES};
+    use crate::pb::Message;
     use crate::transport::MockTransport;
+    use std::sync::{Arc, Mutex};
 
     fn soon() -> Instant {
         Instant::now() + Duration::from_millis(200)
@@ -256,8 +481,7 @@ mod tests {
         mock.queue_read(frame[..5].to_vec()).queue_timeout();
         let mut session = session(mock);
         let mut discarded = 0;
-        let deadline = Instant::now() + Duration::from_millis(20);
-        assert_eq!(session.read_frame(deadline, &mut discarded), Ok(None));
+        assert_eq!(session.read_frame(soon(), &mut discarded), Ok(None));
         assert!(session.is_open());
         assert_eq!(session.decoder.buffered(), 5);
 
@@ -291,6 +515,7 @@ mod tests {
             session.write_bytes(b"x", Duration::from_millis(10)),
             Err(SessionError::Closed)
         );
+        assert_eq!(session.bootstrap(), Err(SessionError::Closed));
     }
 
     #[test]
@@ -396,5 +621,382 @@ mod tests {
         let mut budget = SkipBudget::default();
         assert!(budget.skip(MAX_SKIPPED_BYTES - 8));
         assert!(!budget.skip(0));
+    }
+
+    /// A clock that only moves when the session sleeps.
+    #[derive(Clone)]
+    struct FakeClock {
+        base: Instant,
+        offset: Arc<Mutex<Duration>>,
+        sleeps: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                base: Instant::now(),
+                offset: Arc::new(Mutex::new(Duration::ZERO)),
+                sleeps: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn sleeps_ms(&self) -> Vec<u64> {
+            self.sleeps
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|d| d.as_millis() as u64)
+                .collect()
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&mut self) -> Instant {
+            self.base + *self.offset.lock().unwrap()
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.sleeps.lock().unwrap().push(duration);
+            *self.offset.lock().unwrap() += duration;
+        }
+    }
+
+    fn bootstrap_session(mock: MockTransport) -> (Session<MockTransport>, FakeClock) {
+        let clock = FakeClock::new();
+        (Session::with_clock(mock, Box::new(clock.clone())), clock)
+    }
+
+    fn response(header: Option<Message>, error: Option<Message>, body: Option<(u32, Message)>) -> Vec<u8> {
+        let mut message = Message::new();
+        if let Some(header) = header {
+            message = message.message(field::HEADER, &header);
+        }
+        if let Some(error) = error {
+            message = message.message(field::ERROR, &error);
+        }
+        if let Some((number, body)) = body {
+            message = message.message(number, &body);
+        }
+        encode(message.as_bytes()).unwrap()
+    }
+
+    fn bootstrap_header() -> Message {
+        Message::new().uint(1, 1)
+    }
+
+    fn device_info_body() -> Message {
+        Message::new()
+            .bytes(1, b"Linux")
+            .bytes(3, b"1.2.3")
+            .bytes(4, b"PASE")
+            .bytes(8, b"SN42")
+    }
+
+    fn device_info_response() -> Vec<u8> {
+        response(
+            Some(bootstrap_header()),
+            None,
+            Some((field::DEVICE_INFORMATION, device_info_body())),
+        )
+    }
+
+    fn system_configuration_response() -> Vec<u8> {
+        response(
+            Some(bootstrap_header()),
+            None,
+            Some((field::SYSTEM_CONFIGURATION, Message::new())),
+        )
+    }
+
+    fn auth_response() -> Vec<u8> {
+        response(
+            Some(bootstrap_header()),
+            None,
+            Some((field::DEVICE_AUTHENTICATION, Message::new().bytes(1, b"token"))),
+        )
+    }
+
+    fn queue_remaining_exchanges(mock: &mut MockTransport) {
+        mock.queue_after_write(system_configuration_response())
+            .queue_after_write(auth_response());
+    }
+
+    fn expected_writes() -> Vec<Vec<u8>> {
+        vec![
+            encode(&wire::device_information_query()).unwrap(),
+            encode(&wire::system_configuration_query()).unwrap(),
+            encode(&wire::device_authentication_query()).unwrap(),
+        ]
+    }
+
+    #[test]
+    fn bootstrap_happy_path() {
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(device_info_response());
+        queue_remaining_exchanges(&mut mock);
+        let (mut session, clock) = bootstrap_session(mock);
+
+        let bootstrap = session.bootstrap().unwrap();
+        assert_eq!(bootstrap.device.os_name, "Linux");
+        assert_eq!(bootstrap.device.firmware_version, "1.2.3");
+        assert_eq!(bootstrap.device.product_name, "PASE");
+        assert_eq!(bootstrap.device.serial_number, "SN42");
+        assert_eq!(bootstrap.auth, "token");
+        assert_eq!(bootstrap.readiness_attempts, 1);
+        assert!(session.is_open());
+        assert_eq!(clock.sleeps_ms(), Vec::<u64>::new());
+        let mock = session.into_transport();
+        assert_eq!(mock.writes, expected_writes());
+        assert_eq!(mock.pending_reads(), 0);
+    }
+
+    #[test]
+    fn bootstrap_drains_stale_frames_before_the_first_probe() {
+        let stale = response(
+            Some(Message::new().uint(1, 1).uint(2, 77)),
+            None,
+            Some((field::ACKNOWLEDGEMENT, Message::new())),
+        );
+        let mut mock = MockTransport::new();
+        mock.queue_read(stale).queue_after_write(device_info_response());
+        queue_remaining_exchanges(&mut mock);
+        let (mut session, _) = bootstrap_session(mock);
+        assert!(session.bootstrap().is_ok());
+    }
+
+    #[test]
+    fn bootstrap_skips_stale_tracked_responses() {
+        let stale = response(
+            Some(Message::new().uint(1, 1).uint(2, 9)),
+            None,
+            Some((field::DEVICE_INFORMATION, device_info_body())),
+        );
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(stale).queue_read(device_info_response());
+        queue_remaining_exchanges(&mut mock);
+        let (mut session, _) = bootstrap_session(mock);
+        assert_eq!(session.bootstrap().unwrap().readiness_attempts, 1);
+    }
+
+    #[test]
+    fn bootstrap_skips_headerless_pong_and_events() {
+        let pong = response(None, None, Some((field::PONG, Message::new().bytes(1, b"hello?"))));
+        let event = response(None, None, Some((field::ASYNCHRONOUS_EVENT, Message::new().uint(1, 1))));
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(pong)
+            .queue_read(event)
+            .queue_read(device_info_response());
+        queue_remaining_exchanges(&mut mock);
+        let (mut session, _) = bootstrap_session(mock);
+        assert!(session.bootstrap().is_ok());
+    }
+
+    #[test]
+    fn bootstrap_rejects_unexpected_headers() {
+        let wrong_version = response(
+            Some(Message::new().uint(1, 2)),
+            None,
+            Some((field::DEVICE_INFORMATION, device_info_body())),
+        );
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(wrong_version);
+        let (mut session, _) = bootstrap_session(mock);
+        assert_eq!(session.bootstrap(), Err(SessionError::UnexpectedHeader));
+        assert!(!session.is_open());
+
+        let missing = response(None, None, Some((field::DEVICE_INFORMATION, device_info_body())));
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(missing);
+        let (mut session, _) = bootstrap_session(mock);
+        assert_eq!(session.bootstrap(), Err(SessionError::UnexpectedHeader));
+    }
+
+    #[test]
+    fn bootstrap_fails_on_a_device_error() {
+        let rejected = response(
+            Some(bootstrap_header()),
+            Some(Message::new().uint(1, 1).bytes(2, b"busy")),
+            Some((field::DEVICE_INFORMATION, device_info_body())),
+        );
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(rejected);
+        let (mut session, _) = bootstrap_session(mock);
+        assert_eq!(
+            session.bootstrap(),
+            Err(SessionError::Rejected(ProtocolError {
+                code: 1,
+                why: "busy".into()
+            }))
+        );
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn bootstrap_fails_on_the_wrong_body() {
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(system_configuration_response());
+        let (mut session, _) = bootstrap_session(mock);
+        assert_eq!(
+            session.bootstrap(),
+            Err(SessionError::UnexpectedBody {
+                expected: field::DEVICE_INFORMATION,
+                actual: Some(field::SYSTEM_CONFIGURATION)
+            })
+        );
+
+        let header_only = response(Some(bootstrap_header()), None, None);
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(header_only);
+        let (mut session, _) = bootstrap_session(mock);
+        assert_eq!(
+            session.bootstrap(),
+            Err(SessionError::UnexpectedBody {
+                expected: field::DEVICE_INFORMATION,
+                actual: None
+            })
+        );
+    }
+
+    #[test]
+    fn bootstrap_fails_on_a_malformed_response() {
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(encode(&[0x0a, 0x09, 0x08]).unwrap());
+        let (mut session, _) = bootstrap_session(mock);
+        assert_eq!(
+            session.bootstrap(),
+            Err(SessionError::Decode(DecodeError::Truncated))
+        );
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn bootstrap_retries_only_zero_byte_writes_with_backoff() {
+        let mut mock = MockTransport::new();
+        mock.queue_write_result(Err(WriteError::TimedOut))
+            .queue_write_result(Err(WriteError::TimedOut))
+            .queue_write_result(Ok(()));
+        mock.queue_wait_for_write()
+            .queue_wait_for_write()
+            .queue_after_write(device_info_response());
+        queue_remaining_exchanges(&mut mock);
+        let (mut session, clock) = bootstrap_session(mock);
+
+        let bootstrap = session.bootstrap().unwrap();
+        assert_eq!(bootstrap.readiness_attempts, 3);
+        assert_eq!(clock.sleeps_ms(), [500, 1000]);
+        let mock = session.into_transport();
+        assert_eq!(mock.writes.len(), 5);
+        assert_eq!(mock.writes[0], mock.writes[2]);
+    }
+
+    #[test]
+    fn bootstrap_backoff_caps_at_two_seconds() {
+        let mut mock = MockTransport::new();
+        for _ in 0..4 {
+            mock.queue_write_result(Err(WriteError::TimedOut));
+            mock.queue_wait_for_write();
+        }
+        mock.queue_write_result(Ok(()));
+        mock.queue_after_write(device_info_response());
+        queue_remaining_exchanges(&mut mock);
+        let (mut session, clock) = bootstrap_session(mock);
+
+        assert_eq!(session.bootstrap().unwrap().readiness_attempts, 5);
+        assert_eq!(clock.sleeps_ms(), [500, 1000, 2000, 2000]);
+    }
+
+    #[test]
+    fn bootstrap_partial_write_is_terminal() {
+        let mut mock = MockTransport::new();
+        mock.queue_write_result(Err(WriteError::Partial { written: 3 }));
+        let (mut session, clock) = bootstrap_session(mock);
+        assert_eq!(
+            session.bootstrap(),
+            Err(SessionError::Write(WriteError::Partial { written: 3 }))
+        );
+        assert!(!session.is_open());
+        assert_eq!(clock.sleeps_ms(), Vec::<u64>::new());
+        assert_eq!(session.into_transport().writes.len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_gives_up_at_the_readiness_deadline() {
+        let mut mock = MockTransport::new();
+        for _ in 0..20 {
+            mock.queue_write_result(Err(WriteError::TimedOut));
+        }
+        let (mut session, clock) = bootstrap_session(mock);
+        assert_eq!(
+            session.bootstrap(),
+            Err(SessionError::NotReady { attempts: 12 })
+        );
+        assert!(!session.is_open());
+        let sleeps = clock.sleeps_ms();
+        assert_eq!(sleeps.len(), 12);
+        assert_eq!(&sleeps[..3], [500, 1000, 2000]);
+        assert_eq!(sleeps[11], 500);
+        assert_eq!(sleeps.iter().sum::<u64>(), 20_000);
+        assert_eq!(session.into_transport().writes.len(), 12);
+    }
+
+    #[test]
+    fn bootstrap_does_not_resend_after_a_complete_write_without_reply() {
+        let mut mock = MockTransport::new();
+        mock.queue_wait_for_write();
+        let (mut session, clock) = bootstrap_session(mock);
+        assert_eq!(session.bootstrap(), Err(SessionError::Timeout));
+        assert!(!session.is_open());
+        assert_eq!(clock.sleeps_ms(), Vec::<u64>::new());
+        assert_eq!(session.into_transport().writes.len(), 1);
+    }
+
+    #[test]
+    fn later_exchanges_are_sent_once_and_any_write_failure_is_terminal() {
+        let mut mock = MockTransport::new();
+        mock.queue_write_result(Ok(()))
+            .queue_write_result(Err(WriteError::TimedOut));
+        mock.queue_after_write(device_info_response())
+            .queue_after_write(system_configuration_response());
+        let (mut session, clock) = bootstrap_session(mock);
+        assert_eq!(
+            session.bootstrap(),
+            Err(SessionError::Write(WriteError::TimedOut))
+        );
+        assert!(!session.is_open());
+        assert_eq!(clock.sleeps_ms(), Vec::<u64>::new());
+        assert_eq!(session.into_transport().writes.len(), 2);
+    }
+
+    #[test]
+    fn later_exchange_wrong_body_is_terminal() {
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(device_info_response())
+            .queue_after_write(auth_response());
+        let (mut session, _) = bootstrap_session(mock);
+        assert_eq!(
+            session.bootstrap(),
+            Err(SessionError::UnexpectedBody {
+                expected: field::SYSTEM_CONFIGURATION,
+                actual: Some(field::DEVICE_AUTHENTICATION)
+            })
+        );
+    }
+
+    #[test]
+    fn bootstrap_stops_after_too_many_stale_frames() {
+        let stale = response(
+            Some(Message::new().uint(1, 1).uint(2, 5)),
+            None,
+            Some((field::PONG, Message::new())),
+        );
+        let mut bytes = Vec::new();
+        for _ in 0..=MAX_SKIPPED_FRAMES {
+            bytes.extend(&stale);
+        }
+        let mut mock = MockTransport::new();
+        mock.queue_after_write(bytes);
+        let (mut session, _) = bootstrap_session(mock);
+        assert_eq!(session.bootstrap(), Err(SessionError::TooManySkipped));
+        assert!(!session.is_open());
     }
 }

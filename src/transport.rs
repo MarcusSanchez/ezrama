@@ -76,6 +76,9 @@ pub enum ReadStep {
     Data(Vec<u8>),
     Timeout,
     Error(ReadError),
+    /// Reads time out until a write has happened; the next write consumes
+    /// this step and unblocks whatever follows it.
+    WaitForWrite,
 }
 
 /// Records writes and serves reads from a script.
@@ -109,6 +112,18 @@ impl MockTransport {
         self
     }
 
+    /// Holds later reads at a timeout until the next write.
+    pub fn queue_wait_for_write(&mut self) -> &mut Self {
+        self.reads.push_back(ReadStep::WaitForWrite);
+        self
+    }
+
+    /// Serves `bytes` only after the next write, as a device replying to a
+    /// request would.
+    pub fn queue_after_write(&mut self, bytes: impl Into<Vec<u8>>) -> &mut Self {
+        self.queue_wait_for_write().queue_read(bytes)
+    }
+
     /// Makes a later write return `result`. Writes without a queued result
     /// succeed.
     pub fn queue_write_result(&mut self, result: Result<(), WriteError>) -> &mut Self {
@@ -125,14 +140,21 @@ impl MockTransport {
 impl Transport for MockTransport {
     fn write(&mut self, data: &[u8], _timeout: Duration) -> Result<(), WriteError> {
         self.writes.push(data.to_vec());
+        if self.reads.front() == Some(&ReadStep::WaitForWrite) {
+            self.reads.pop_front();
+        }
         self.write_results.pop_front().unwrap_or(Ok(()))
     }
 
     fn read(&mut self, _timeout: Duration) -> Result<Vec<u8>, ReadError> {
+        if self.reads.front() == Some(&ReadStep::WaitForWrite) {
+            return Ok(Vec::new());
+        }
         match self.reads.pop_front() {
             Some(ReadStep::Data(bytes)) => Ok(bytes),
             Some(ReadStep::Timeout) | None => Ok(Vec::new()),
             Some(ReadStep::Error(error)) => Err(error),
+            Some(ReadStep::WaitForWrite) => Ok(Vec::new()),
         }
     }
 }
@@ -172,6 +194,20 @@ mod tests {
         assert_eq!(mock.read(T), Ok(Vec::new()));
         assert_eq!(mock.read(T), Err(ReadError::Lost("unplugged".into())));
         assert_eq!(mock.read(T), Ok(Vec::new()));
+        assert_eq!(mock.pending_reads(), 0);
+    }
+
+    #[test]
+    fn mock_holds_reads_until_a_write_happens() {
+        let mut mock = MockTransport::new();
+        mock.queue_read(b"stale".to_vec())
+            .queue_after_write(b"reply".to_vec());
+        assert_eq!(mock.read(T), Ok(b"stale".to_vec()));
+        assert_eq!(mock.read(T), Ok(Vec::new()));
+        assert_eq!(mock.read(T), Ok(Vec::new()));
+        assert_eq!(mock.pending_reads(), 2);
+        assert_eq!(mock.write(b"request", T), Ok(()));
+        assert_eq!(mock.read(T), Ok(b"reply".to_vec()));
         assert_eq!(mock.pending_reads(), 0);
     }
 
