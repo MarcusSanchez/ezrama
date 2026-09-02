@@ -526,7 +526,7 @@ fn run(verbose: bool, interval: Duration) -> ExitCode {
         last_outbound,
         &stop_signal::requested,
         &mut |event| match event {
-            HoldEvent::Pinged(reply) => {
+            HoldEvent::Pinged(reply, drained) => {
                 pings += 1;
                 if verbose {
                     let reply = match reply {
@@ -534,7 +534,7 @@ fn run(verbose: bool, interval: Duration) -> ExitCode {
                         OptionalReply::Acknowledged => "acknowledged",
                         OptionalReply::Drained => "reply consumed",
                     };
-                    println!("ping {pings}: {reply}");
+                    println!("ping {pings}: {reply}; {drained} unasked frames drained so far");
                 }
             }
             HoldEvent::Retrying { attempt, error } => {
@@ -713,10 +713,10 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
             last_outbound,
             &|| devnotify::interrupted() || stop_signal::requested(),
             &mut |event| match event {
-                HoldEvent::Pinged(_) => {
+                HoldEvent::Pinged(_, drained) => {
                     pings += 1;
                     if verbose {
-                        log.log(&format!("ping {pings}"));
+                        log.log(&format!("ping {pings}; {drained} unasked frames drained so far"));
                     }
                 }
                 HoldEvent::Retrying { attempt, error } => {

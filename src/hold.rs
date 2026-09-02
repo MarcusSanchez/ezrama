@@ -24,8 +24,9 @@ const WAIT_SLICE: Duration = Duration::from_millis(100);
 /// Something the holding loop did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HoldEvent {
-    /// A Ping transferred.
-    Pinged(OptionalReply),
+    /// A Ping transferred. `drained` is how many frames the session had
+    /// swept up, unasked for, before this Ping went out.
+    Pinged(OptionalReply, u64),
     /// A Ping write transferred nothing and will be retried after a pause.
     Retrying { attempt: u32, error: SessionError },
     /// A stop was requested and honoured.
@@ -70,7 +71,7 @@ pub fn hold<T: Transport>(
             KeepaliveOutcome::Sent(reply) => {
                 retries = 0;
                 next = session.now() + interval;
-                on_event(HoldEvent::Pinged(reply));
+                on_event(HoldEvent::Pinged(reply, session.drained_frames()));
             }
             KeepaliveOutcome::Retryable(error) => {
                 retries += 1;
@@ -117,7 +118,7 @@ mod tests {
             start,
             &|| pings.get() >= max_pings,
             &mut |event| {
-                if matches!(event, HoldEvent::Pinged(_)) {
+                if matches!(event, HoldEvent::Pinged(..)) {
                     pings.set(pings.get() + 1);
                 }
                 events.push(event);
@@ -134,9 +135,9 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                HoldEvent::Pinged(OptionalReply::None),
-                HoldEvent::Pinged(OptionalReply::None),
-                HoldEvent::Pinged(OptionalReply::None),
+                HoldEvent::Pinged(OptionalReply::None, 0),
+                HoldEvent::Pinged(OptionalReply::None, 0),
+                HoldEvent::Pinged(OptionalReply::None, 0),
                 HoldEvent::Stopped,
             ]
         );
@@ -184,7 +185,7 @@ mod tests {
                     attempt: 2,
                     error: SessionError::Write(WriteError::TimedOut)
                 },
-                HoldEvent::Pinged(OptionalReply::None),
+                HoldEvent::Pinged(OptionalReply::None, 0),
                 HoldEvent::Stopped,
             ]
         );

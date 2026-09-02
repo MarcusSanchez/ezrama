@@ -182,6 +182,7 @@ pub struct Session<T: Transport> {
     closed: Option<SessionError>,
     clock: Box<dyn Clock + Send>,
     next_track: u64,
+    drained_frames: u64,
 }
 
 /// A random starting point for track ids, so a new session's ids do not
@@ -202,7 +203,15 @@ impl<T: Transport> Session<T> {
             closed: None,
             clock,
             next_track: random_track_seed(),
+            drained_frames: 0,
         }
+    }
+
+    /// Complete frames swept up by drains since the session began. These
+    /// are frames the device sent that no exchange of this session was
+    /// waiting for.
+    pub fn drained_frames(&self) -> u64 {
+        self.drained_frames
     }
 
     /// Sets where track ids continue from, for reproducible sessions.
@@ -350,6 +359,7 @@ impl<T: Transport> Session<T> {
             self.decoder.push(&bytes);
         }
         self.decoder.clear();
+        self.drained_frames += drained.len() as u64;
         Ok(drained)
     }
 
@@ -925,6 +935,20 @@ mod tests {
         let mut session = session(MockTransport::new());
         assert_eq!(session.drain_queued(), Ok(Vec::new()));
         assert!(session.is_open());
+    }
+
+    #[test]
+    fn drained_frames_are_counted() {
+        let mut bytes = encode(b"one").unwrap();
+        bytes.extend(encode(b"two").unwrap());
+        let mut mock = MockTransport::new();
+        mock.queue_read(bytes).queue_timeout().queue_read(encode(b"three").unwrap());
+        let mut session = session(mock);
+        assert_eq!(session.drained_frames(), 0);
+        session.drain_queued().unwrap();
+        assert_eq!(session.drained_frames(), 2);
+        session.drain_queued().unwrap();
+        assert_eq!(session.drained_frames(), 3);
     }
 
     #[test]
