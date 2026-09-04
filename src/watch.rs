@@ -24,6 +24,8 @@ pub enum Event {
     OpenKanali,
     /// The KANALI started on request has exited.
     KanaliClosed,
+    /// Turn the logon entry on or off.
+    SetStartup(bool),
     /// The watcher should release the display and exit.
     Quit,
 }
@@ -167,7 +169,7 @@ impl Control {
                 self.launch_pending = false;
             }
             Event::Quit => return Directive::Quit,
-            Event::Arrived(_) | Event::Removed(_) => {}
+            Event::Arrived(_) | Event::Removed(_) | Event::SetStartup(_) => {}
         }
         Directive::Continue
     }
@@ -300,6 +302,7 @@ mod tests {
         assert!(!Event::Arrived("a".into()).interrupts());
         assert!(!Event::Resume.interrupts());
         assert!(!Event::KanaliClosed.interrupts());
+        assert!(!Event::SetStartup(true).interrupts());
     }
 
     #[test]

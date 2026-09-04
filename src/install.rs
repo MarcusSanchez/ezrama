@@ -247,6 +247,37 @@ pub fn delete_run_value(name: &str) -> Result<bool, WinError> {
     Ok(true)
 }
 
+/// Whether ezrama's logon entry exists.
+pub fn startup_enabled() -> bool {
+    matches!(read_run_value(RUN_VALUE), Ok(Some(_)))
+}
+
+/// Adds or removes the logon entry `name` for the watcher next to this
+/// executable. Returns whether anything changed.
+pub fn set_startup_value(name: &str, enabled: bool) -> Result<bool, WinError> {
+    if !enabled {
+        return delete_run_value(name);
+    }
+    let watcher = std::env::current_exe()
+        .ok()
+        .and_then(|own| own.parent().map(|directory| directory.join(WATCHER_BINARY)))
+        .ok_or(WinError {
+            call: "GetModuleFileNameW",
+            code: ERROR_FILE_NOT_FOUND,
+        })?;
+    let command = run_command(&watcher);
+    if read_string(HKEY_CURRENT_USER, RUN_KEY, name)?.as_deref() == Some(command.as_str()) {
+        return Ok(false);
+    }
+    set_run_value(name, &command)?;
+    Ok(true)
+}
+
+/// Adds or removes ezrama's logon entry. Returns whether anything changed.
+pub fn set_startup(enabled: bool) -> Result<bool, WinError> {
+    set_startup_value(RUN_VALUE, enabled)
+}
+
 /// Every value under the Run key.
 pub fn run_entries() -> Result<Vec<RunEntry>, WinError> {
     let key = open_run_key(KEY_QUERY_VALUE)?;
@@ -483,6 +514,18 @@ mod tests {
         let bytes: Vec<u8> = "%SystemRoot%".encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert_eq!(registry_string(REG_EXPAND_SZ, &bytes), root);
         assert_eq!(registry_string(REG_SZ, &bytes), "%SystemRoot%");
+    }
+
+    #[test]
+    fn a_logon_entry_toggles_on_and_off() {
+        let name = format!("ezrama-test-{}", std::process::id());
+        assert_eq!(set_startup_value(&name, false), Ok(false));
+        assert_eq!(set_startup_value(&name, true), Ok(true));
+        let command = read_run_value(&name).unwrap().unwrap();
+        assert!(command.ends_with(&format!("{WATCHER_BINARY}\" watch")));
+        assert_eq!(set_startup_value(&name, true), Ok(false), "already set");
+        assert_eq!(set_startup_value(&name, false), Ok(true));
+        assert_eq!(read_run_value(&name), Ok(None));
     }
 
     #[test]

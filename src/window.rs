@@ -18,8 +18,9 @@ use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::install;
 use crate::overlapped::wait_millis;
-use crate::tray::{self, Icon, MenuChoice, TrayIcon};
+use crate::tray::{self, Icon, MenuChoice, MenuFacts, TrayIcon};
 use crate::usbprint::{is_panorama_path, wide, WinError};
 use crate::watch::{Event, State};
 use crate::win::*;
@@ -339,11 +340,15 @@ unsafe fn broadcast_path(lparam: LPARAM) -> Option<String> {
 
 /// Shows the menu for the current state and acts on the choice.
 fn show_menu(window: HWND) {
-    let kanali = KANALI_AVAILABLE.load(Ordering::SeqCst);
-    match tray::show_menu(window, state(), kanali) {
+    let facts = MenuFacts {
+        kanali: KANALI_AVAILABLE.load(Ordering::SeqCst),
+        startup: install::startup_enabled(),
+    };
+    match tray::show_menu(window, state(), facts) {
         Some(MenuChoice::Pause) => post_event(Event::Pause),
         Some(MenuChoice::Resume) => post_event(Event::Resume),
         Some(MenuChoice::OpenKanali) => post_event(Event::OpenKanali),
+        Some(MenuChoice::ToggleStartup) => post_event(Event::SetStartup(!facts.startup)),
         Some(MenuChoice::Quit) => quit(),
         None => {}
     }

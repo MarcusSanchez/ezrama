@@ -23,7 +23,8 @@ with Windows" in KANALI's own settings, or the two race for the panel at
 logon.
 
 While it runs, ezrama sits in the notification area. Its menu shows the
-current status and offers Pause, Resume, Open KANALI, and Quit.
+current status and offers Pause, Resume, Open KANALI, a Start with Windows
+toggle, and Quit.
 
 ## Running alongside KANALI
 

@@ -198,10 +198,13 @@ impl Menu {
         Ok(Self { handle })
     }
 
-    /// Appends an item that reports `id` when chosen.
-    pub fn item(&self, id: usize, text: &str, enabled: bool) {
+    /// Appends an item that reports `id` when chosen, with a check mark
+    /// when `checked`.
+    pub fn item(&self, id: usize, text: &str, enabled: bool, checked: bool) {
         let text = wide(text);
-        let flags = MF_STRING | if enabled { 0 } else { MF_GRAYED };
+        let flags = MF_STRING
+            | if enabled { 0 } else { MF_GRAYED }
+            | if checked { MF_CHECKED } else { 0 };
         unsafe {
             AppendMenuW(self.handle, flags, id, text.as_ptr());
         }
@@ -253,6 +256,8 @@ pub enum MenuChoice {
     Pause,
     Resume,
     OpenKanali,
+    /// Turn the logon entry on or off.
+    ToggleStartup,
     Quit,
 }
 
@@ -266,52 +271,72 @@ pub enum MenuEntry {
         choice: MenuChoice,
         text: &'static str,
         enabled: bool,
+        checked: bool,
     },
 }
 
-/// The menu for a watcher in `state`; `kanali` says whether KANALI is
-/// installed and can be started.
-pub fn menu_entries(state: State, kanali: bool) -> Vec<MenuEntry> {
+impl MenuEntry {
+    fn item(choice: MenuChoice, text: &'static str, enabled: bool) -> Self {
+        MenuEntry::Item {
+            choice,
+            text,
+            enabled,
+            checked: false,
+        }
+    }
+}
+
+/// What the menu reflects besides the watcher's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuFacts {
+    /// Whether KANALI is installed and can be started.
+    pub kanali: bool,
+    /// Whether the logon entry exists.
+    pub startup: bool,
+}
+
+/// The menu for a watcher in `state`.
+pub fn menu_entries(state: State, facts: MenuFacts) -> Vec<MenuEntry> {
     let toggle = if state.released() {
-        MenuEntry::Item {
-            choice: MenuChoice::Resume,
-            text: "Resume",
-            enabled: true,
-        }
+        MenuEntry::item(MenuChoice::Resume, "Resume", true)
     } else {
-        MenuEntry::Item {
-            choice: MenuChoice::Pause,
-            text: "Pause",
-            enabled: true,
-        }
+        MenuEntry::item(MenuChoice::Pause, "Pause", true)
     };
     vec![
         MenuEntry::Label(state.label().to_string()),
         MenuEntry::Separator,
         toggle,
-        MenuEntry::Item {
-            choice: MenuChoice::OpenKanali,
-            text: if kanali { "Open KANALI" } else { "KANALI is not installed" },
-            enabled: kanali && state != State::WaitingForKanali,
-        },
+        MenuEntry::item(
+            MenuChoice::OpenKanali,
+            if facts.kanali { "Open KANALI" } else { "KANALI is not installed" },
+            facts.kanali && state != State::WaitingForKanali,
+        ),
         MenuEntry::Separator,
         MenuEntry::Item {
-            choice: MenuChoice::Quit,
-            text: "Quit",
+            choice: MenuChoice::ToggleStartup,
+            text: "Start with Windows",
             enabled: true,
+            checked: facts.startup,
         },
+        MenuEntry::Separator,
+        MenuEntry::item(MenuChoice::Quit, "Quit", true),
     ]
 }
 
 /// Shows the menu for `state` at the cursor and returns what was chosen.
-pub fn show_menu(window: HWND, state: State, kanali: bool) -> Option<MenuChoice> {
+pub fn show_menu(window: HWND, state: State, facts: MenuFacts) -> Option<MenuChoice> {
     let menu = Menu::new().ok()?;
-    let entries = menu_entries(state, kanali);
+    let entries = menu_entries(state, facts);
     for (index, entry) in entries.iter().enumerate() {
         match entry {
-            MenuEntry::Label(text) => menu.item(0, text, false),
+            MenuEntry::Label(text) => menu.item(0, text, false, false),
             MenuEntry::Separator => menu.separator(),
-            MenuEntry::Item { text, enabled, .. } => menu.item(index + 1, text, *enabled),
+            MenuEntry::Item {
+                text,
+                enabled,
+                checked,
+                ..
+            } => menu.item(index + 1, text, *enabled, *checked),
         }
     }
     let chosen = menu.show(window)?;
@@ -330,31 +355,60 @@ mod tests {
         entries
             .iter()
             .filter_map(|entry| match entry {
-                MenuEntry::Item { choice, text, enabled } => Some((*choice, *text, *enabled)),
+                MenuEntry::Item {
+                    choice, text, enabled, ..
+                } => Some((*choice, *text, *enabled)),
                 _ => None,
             })
             .collect()
     }
 
+    fn facts(kanali: bool, startup: bool) -> MenuFacts {
+        MenuFacts { kanali, startup }
+    }
+
     #[test]
     fn the_menu_follows_the_state() {
-        let active = menu_entries(State::Active, true);
+        let active = menu_entries(State::Active, facts(true, true));
         assert_eq!(active[0], MenuEntry::Label("Active".to_string()));
         assert_eq!(
             items(&active),
             [
                 (MenuChoice::Pause, "Pause", true),
                 (MenuChoice::OpenKanali, "Open KANALI", true),
+                (MenuChoice::ToggleStartup, "Start with Windows", true),
                 (MenuChoice::Quit, "Quit", true)
             ]
         );
-        assert_eq!(items(&menu_entries(State::Paused, true))[0], (MenuChoice::Resume, "Resume", true));
-        let waiting = items(&menu_entries(State::WaitingForKanali, true));
+        assert_eq!(
+            items(&menu_entries(State::Paused, facts(true, true)))[0],
+            (MenuChoice::Resume, "Resume", true)
+        );
+        let waiting = items(&menu_entries(State::WaitingForKanali, facts(true, true)));
         assert_eq!(waiting[0].0, MenuChoice::Resume);
         assert_eq!(waiting[1], (MenuChoice::OpenKanali, "Open KANALI", false));
-        let missing = items(&menu_entries(State::Connecting, false));
+        let missing = items(&menu_entries(State::Connecting, facts(false, true)));
         assert_eq!(missing[1], (MenuChoice::OpenKanali, "KANALI is not installed", false));
-        assert_eq!(menu_entries(State::NoDisplay, true).len(), 6);
+        assert_eq!(menu_entries(State::NoDisplay, facts(true, false)).len(), 8);
+    }
+
+    #[test]
+    fn the_startup_item_is_checked_when_the_logon_entry_exists() {
+        let checked = |startup: bool| {
+            menu_entries(State::Active, facts(true, startup))
+                .into_iter()
+                .find_map(|entry| match entry {
+                    MenuEntry::Item {
+                        choice: MenuChoice::ToggleStartup,
+                        checked,
+                        ..
+                    } => Some(checked),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(checked(true));
+        assert!(!checked(false));
     }
 
     /// Reads a square bitmap back as pixels.
@@ -459,9 +513,9 @@ mod tests {
     #[test]
     fn menus_are_created_and_destroyed() {
         let menu = Menu::new().unwrap();
-        menu.item(1, "One", true);
+        menu.item(1, "One", true, false);
         menu.separator();
-        menu.item(2, "Two", false);
+        menu.item(2, "Two", false, true);
         drop(menu);
     }
 }
