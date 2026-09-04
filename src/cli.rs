@@ -120,14 +120,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     }
 }
 
-/// Whether this process is the only one attached to its console, which is
-/// how a console program started from Explorer or a shortcut finds itself:
-/// its window closes the moment it exits.
 #[cfg(windows)]
 fn owns_console() -> bool {
-    use crate::win::GetConsoleProcessList;
-    let mut ids = [0u32; 2];
-    unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) == 1 }
+    crate::launcher::owns_console()
 }
 
 #[cfg(not(windows))]
@@ -744,6 +739,7 @@ fn spawn_watcher(watcher: &std::path::Path) -> Result<u32, crate::usbprint::WinE
 fn install() -> ExitCode {
     use crate::install::*;
     use crate::shortcut;
+    use crate::usbprint::same_path;
 
     let Some(directory) = install_dir() else {
         eprintln!("LOCALAPPDATA is not set; cannot choose an installation directory");
@@ -763,9 +759,7 @@ fn install() -> ExitCode {
         println!("stopped the running watcher");
     }
 
-    let already_installed = own
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&installed_console.to_string_lossy());
+    let already_installed = same_path(&own, &installed_console);
     if already_installed {
         println!("already running from {}", directory.display());
     } else {
@@ -821,20 +815,7 @@ fn install() -> ExitCode {
     }
     println!("logon entry {RUN_VALUE}: {command}");
 
-    let size_kb = [CONSOLE_BINARY, WATCHER_BINARY, ICON_FILE]
-        .iter()
-        .filter_map(|name| std::fs::metadata(directory.join(name)).ok())
-        .map(|metadata| metadata.len())
-        .sum::<u64>()
-        .div_ceil(1024) as u32;
-    let entry = UninstallEntry {
-        display_name: NAME.to_string(),
-        version: VERSION.to_string(),
-        icon: icon.clone(),
-        location: directory.clone(),
-        uninstall_command: format!("\"{}\" uninstall", installed_console.display()),
-        size_kb,
-    };
+    let entry = uninstall_entry_for(&directory, NAME, VERSION);
     match write_uninstall_entry(UNINSTALL_SUBKEY, &entry) {
         Ok(()) => println!("listed in Settings under Apps as {NAME} {VERSION}"),
         Err(error) => {
@@ -869,7 +850,6 @@ fn install() -> ExitCode {
             return ExitCode::from(1);
         }
     }
-    let _ = installed_console;
     ExitCode::SUCCESS
 }
 
@@ -881,6 +861,7 @@ fn uninstall() -> ExitCode {
     use crate::launcher;
     use crate::log::default_log_path;
     use crate::shortcut;
+    use crate::usbprint::same_path;
 
     if stop_watcher_and_wait() {
         println!("stopped the running watcher");
@@ -942,7 +923,7 @@ fn uninstall() -> ExitCode {
     }
     let console = directory.join(CONSOLE_BINARY);
     let running_installed = std::env::current_exe()
-        .map(|own| own.to_string_lossy().eq_ignore_ascii_case(&console.to_string_lossy()))
+        .map(|own| same_path(&own, &console))
         .unwrap_or(false);
     if running_installed {
         let own = std::slice::from_ref(&console);

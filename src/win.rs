@@ -73,6 +73,7 @@ pub const HKEY_CURRENT_USER: HKEY = 0x8000_0001usize as HKEY;
 pub const HKEY_LOCAL_MACHINE: HKEY = 0x8000_0002usize as HKEY;
 pub const KEY_QUERY_VALUE: DWORD = 0x0001;
 pub const KEY_SET_VALUE: DWORD = 0x0002;
+pub const KEY_READ: DWORD = 0x0002_0019;
 pub const KEY_WRITE: DWORD = 0x0002_0006;
 pub const REG_SZ: DWORD = 1;
 pub const REG_EXPAND_SZ: DWORD = 2;
@@ -229,6 +230,45 @@ extern "system" {
         lpszWindow: *const u16,
     ) -> HWND;
     pub fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut DWORD) -> DWORD;
+    pub fn LoadImageW(
+        hInst: HANDLE,
+        name: *const u16,
+        r#type: u32,
+        cx: i32,
+        cy: i32,
+        fuLoad: u32,
+    ) -> HANDLE;
+    pub fn GetSystemMetrics(nIndex: i32) -> i32;
+    pub fn SetProcessDpiAwarenessContext(value: HANDLE) -> BOOL;
+    pub fn RegisterWindowMessageW(lpString: *const u16) -> u32;
+    pub fn SendMessageTimeoutW(
+        hWnd: HWND,
+        Msg: u32,
+        wParam: WPARAM,
+        lParam: LPARAM,
+        fuFlags: DWORD,
+        uTimeout: u32,
+        lpdwResult: *mut usize,
+    ) -> LRESULT;
+    pub fn SetForegroundWindow(hWnd: HWND) -> BOOL;
+    pub fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
+    pub fn CreatePopupMenu() -> HMENU;
+    pub fn AppendMenuW(hMenu: HMENU, uFlags: DWORD, uIDNewItem: usize, lpNewItem: *const u16) -> BOOL;
+    pub fn TrackPopupMenu(
+        hMenu: HMENU,
+        uFlags: DWORD,
+        x: i32,
+        y: i32,
+        nReserved: i32,
+        hWnd: HWND,
+        prcRect: *const c_void,
+    ) -> BOOL;
+    pub fn DestroyMenu(hMenu: HMENU) -> BOOL;
+    pub fn GetIconInfo(hIcon: HICON, piconinfo: *mut ICONINFO) -> BOOL;
+    pub fn CreateIconIndirect(piconinfo: *const ICONINFO) -> HICON;
+    pub fn DestroyIcon(hIcon: HICON) -> BOOL;
+    pub fn GetDC(hWnd: HWND) -> HDC;
+    pub fn ReleaseDC(hWnd: HWND, hDC: HDC) -> i32;
 }
 
 pub const DIGCF_PRESENT: DWORD = 0x0000_0002;
@@ -369,6 +409,31 @@ extern "system" {
     pub fn OpenEventW(dwDesiredAccess: DWORD, bInheritHandle: BOOL, lpName: *const u16) -> HANDLE;
     pub fn SetEvent(hEvent: HANDLE) -> BOOL;
     pub fn ResetEvent(hEvent: HANDLE) -> BOOL;
+    pub fn CreateToolhelp32Snapshot(dwFlags: DWORD, th32ProcessID: DWORD) -> HANDLE;
+    pub fn Process32FirstW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
+    pub fn Process32NextW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
+    pub fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) -> HANDLE;
+    pub fn WaitForMultipleObjects(nCount: DWORD, lpHandles: *const HANDLE, bWaitAll: BOOL, dwMilliseconds: DWORD) -> DWORD;
+    pub fn GetCurrentProcessId() -> DWORD;
+    pub fn GetCurrentProcess() -> HANDLE;
+    pub fn SetProcessWorkingSetSizeEx(
+        hProcess: HANDLE,
+        dwMinimumWorkingSetSize: usize,
+        dwMaximumWorkingSetSize: usize,
+        Flags: DWORD,
+    ) -> BOOL;
+    pub fn CreateProcessW(
+        lpApplicationName: *const u16,
+        lpCommandLine: *mut u16,
+        lpProcessAttributes: *mut c_void,
+        lpThreadAttributes: *mut c_void,
+        bInheritHandles: BOOL,
+        dwCreationFlags: DWORD,
+        lpEnvironment: *mut c_void,
+        lpCurrentDirectory: *const u16,
+        lpStartupInfo: *const STARTUPINFOW,
+        lpProcessInformation: *mut PROCESS_INFORMATION,
+    ) -> BOOL;
 }
 
 pub type HICON = HANDLE;
@@ -484,52 +549,7 @@ extern "system" {
 pub const IMAGE_ICON: u32 = 1;
 pub const LR_LOADFROMFILE: u32 = 0x0010;
 
-#[link(name = "user32")]
-extern "system" {
-    pub fn LoadImageW(
-        hInst: HANDLE,
-        name: *const u16,
-        r#type: u32,
-        cx: i32,
-        cy: i32,
-        fuLoad: u32,
-    ) -> HANDLE;
-}
 
-#[link(name = "user32")]
-extern "system" {
-    pub fn GetSystemMetrics(nIndex: i32) -> i32;
-    pub fn SetProcessDpiAwarenessContext(value: HANDLE) -> BOOL;
-    pub fn RegisterWindowMessageW(lpString: *const u16) -> u32;
-    pub fn SendMessageTimeoutW(
-        hWnd: HWND,
-        Msg: u32,
-        wParam: WPARAM,
-        lParam: LPARAM,
-        fuFlags: DWORD,
-        uTimeout: u32,
-        lpdwResult: *mut usize,
-    ) -> LRESULT;
-    pub fn SetForegroundWindow(hWnd: HWND) -> BOOL;
-    pub fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
-    pub fn CreatePopupMenu() -> HMENU;
-    pub fn AppendMenuW(hMenu: HMENU, uFlags: DWORD, uIDNewItem: usize, lpNewItem: *const u16) -> BOOL;
-    pub fn TrackPopupMenu(
-        hMenu: HMENU,
-        uFlags: DWORD,
-        x: i32,
-        y: i32,
-        nReserved: i32,
-        hWnd: HWND,
-        prcRect: *const c_void,
-    ) -> BOOL;
-    pub fn DestroyMenu(hMenu: HMENU) -> BOOL;
-    pub fn GetIconInfo(hIcon: HICON, piconinfo: *mut ICONINFO) -> BOOL;
-    pub fn CreateIconIndirect(piconinfo: *const ICONINFO) -> HICON;
-    pub fn DestroyIcon(hIcon: HICON) -> BOOL;
-    pub fn GetDC(hWnd: HWND) -> HDC;
-    pub fn ReleaseDC(hWnd: HWND, hDC: HDC) -> i32;
-}
 
 #[link(name = "gdi32")]
 extern "system" {
@@ -555,22 +575,6 @@ extern "system" {
     pub fn GdiFlush() -> BOOL;
 }
 
-#[link(name = "kernel32")]
-extern "system" {
-    pub fn CreateToolhelp32Snapshot(dwFlags: DWORD, th32ProcessID: DWORD) -> HANDLE;
-    pub fn Process32FirstW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
-    pub fn Process32NextW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
-    pub fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) -> HANDLE;
-    pub fn WaitForMultipleObjects(nCount: DWORD, lpHandles: *const HANDLE, bWaitAll: BOOL, dwMilliseconds: DWORD) -> DWORD;
-    pub fn GetCurrentProcessId() -> DWORD;
-    pub fn GetCurrentProcess() -> HANDLE;
-    pub fn SetProcessWorkingSetSizeEx(
-        hProcess: HANDLE,
-        dwMinimumWorkingSetSize: usize,
-        dwMaximumWorkingSetSize: usize,
-        Flags: DWORD,
-    ) -> BOOL;
-}
 
 pub const DETACHED_PROCESS: DWORD = 0x0000_0008;
 
@@ -604,21 +608,6 @@ pub struct PROCESS_INFORMATION {
     pub dwThreadId: DWORD,
 }
 
-#[link(name = "kernel32")]
-extern "system" {
-    pub fn CreateProcessW(
-        lpApplicationName: *const u16,
-        lpCommandLine: *mut u16,
-        lpProcessAttributes: *mut c_void,
-        lpThreadAttributes: *mut c_void,
-        bInheritHandles: BOOL,
-        dwCreationFlags: DWORD,
-        lpEnvironment: *mut c_void,
-        lpCurrentDirectory: *const u16,
-        lpStartupInfo: *const STARTUPINFOW,
-        lpProcessInformation: *mut PROCESS_INFORMATION,
-    ) -> BOOL;
-}
 
 pub type HRESULT = i32;
 

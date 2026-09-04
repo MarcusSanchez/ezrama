@@ -162,6 +162,16 @@ pub fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
 }
 
+/// Whether two paths name the same file as the file system sees them:
+/// compared unit for unit, ignoring ASCII case.
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    let fold = |unit: u16| match u8::try_from(unit) {
+        Ok(byte) => u16::from(byte.to_ascii_lowercase()),
+        Err(_) => unit,
+    };
+    a.as_os_str().encode_wide().map(fold).eq(b.as_os_str().encode_wide().map(fold))
+}
+
 /// Outcome of looking for the display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Discovery {
@@ -294,6 +304,15 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
+
+    #[test]
+    fn same_path_ignores_ascii_case_only() {
+        let a = Path::new(r"C:\Ezrama\EZRAMA.exe");
+        let b = Path::new(r"c:\ezrama\ezrama.EXE");
+        assert!(same_path(a, b));
+        assert!(!same_path(Path::new(r"C:\ezrama\ezrama.exe"), Path::new(r"C:\ezrama\ezramaw.exe")));
+        assert!(!same_path(Path::new("\u{c9}"), Path::new("\u{e9}")), "non-ASCII case is left alone");
+    }
 
     #[test]
     fn wide_paths_keep_unpaired_surrogates() {

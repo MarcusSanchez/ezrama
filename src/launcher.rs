@@ -9,8 +9,8 @@ use std::ptr;
 use std::thread;
 use std::time::Duration;
 
-use crate::install::read_string;
 use crate::overlapped::wait_millis;
+use crate::registry::{read_string, Root};
 use crate::usbprint::{wide_path, WinError};
 use crate::win::*;
 
@@ -113,6 +113,14 @@ pub fn start_detached(
     })
 }
 
+/// Whether this process is the only one attached to its console, which is
+/// how a console program started from Explorer or a shortcut finds
+/// itself: its window closes the moment it exits.
+pub fn owns_console() -> bool {
+    let mut ids = [0u32; 2];
+    unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) == 1 }
+}
+
 /// Arranges for `files` to be deleted, and then `directory` removed if it
 /// is empty, about `delay_seconds` after this call, by a detached command
 /// interpreter that outlives this process. This is how a program removes
@@ -149,7 +157,7 @@ pub fn icon_source_path(value: &str) -> &str {
 /// Where KANALI's executable is, if it is installed.
 pub fn kanali_path() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+    for root in [Root::CurrentUser, Root::LocalMachine] {
         if let Ok(Some(value)) = read_string(root, KANALI_UNINSTALL_KEY, "DisplayIcon") {
             candidates.push(PathBuf::from(icon_source_path(&value)));
         }

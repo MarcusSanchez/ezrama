@@ -198,21 +198,28 @@ impl Menu {
         Ok(Self { handle })
     }
 
-    /// Appends an item that reports `id` when chosen, with a check mark
-    /// when `checked`.
-    pub fn item(&self, id: usize, text: &str, enabled: bool, checked: bool) {
+    /// Appends `entry`; an item reports `id` when chosen.
+    pub fn append(&self, id: usize, entry: &MenuEntry) {
+        let (text, flags) = match entry {
+            MenuEntry::Separator => {
+                unsafe {
+                    AppendMenuW(self.handle, MF_SEPARATOR, 0, ptr::null());
+                }
+                return;
+            }
+            MenuEntry::Label(text) => (text.as_str(), MF_STRING | MF_GRAYED),
+            MenuEntry::Item {
+                text, enabled, checked, ..
+            } => (
+                *text,
+                MF_STRING
+                    | if *enabled { 0 } else { MF_GRAYED }
+                    | if *checked { MF_CHECKED } else { 0 },
+            ),
+        };
         let text = wide(text);
-        let flags = MF_STRING
-            | if enabled { 0 } else { MF_GRAYED }
-            | if checked { MF_CHECKED } else { 0 };
         unsafe {
             AppendMenuW(self.handle, flags, id, text.as_ptr());
-        }
-    }
-
-    pub fn separator(&self) {
-        unsafe {
-            AppendMenuW(self.handle, MF_SEPARATOR, 0, ptr::null());
         }
     }
 
@@ -328,16 +335,8 @@ pub fn show_menu(window: HWND, state: State, facts: MenuFacts) -> Option<MenuCho
     let menu = Menu::new().ok()?;
     let entries = menu_entries(state, facts);
     for (index, entry) in entries.iter().enumerate() {
-        match entry {
-            MenuEntry::Label(text) => menu.item(0, text, false, false),
-            MenuEntry::Separator => menu.separator(),
-            MenuEntry::Item {
-                text,
-                enabled,
-                checked,
-                ..
-            } => menu.item(index + 1, text, *enabled, *checked),
-        }
+        let id = if matches!(entry, MenuEntry::Item { .. }) { index + 1 } else { 0 };
+        menu.append(id, entry);
     }
     let chosen = menu.show(window)?;
     match entries.get(chosen - 1) {
@@ -513,9 +512,9 @@ mod tests {
     #[test]
     fn menus_are_created_and_destroyed() {
         let menu = Menu::new().unwrap();
-        menu.item(1, "One", true, false);
-        menu.separator();
-        menu.item(2, "Two", false, true);
+        for (id, entry) in menu_entries(State::Active, facts(true, true)).iter().enumerate() {
+            menu.append(id, entry);
+        }
         drop(menu);
     }
 }
