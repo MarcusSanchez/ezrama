@@ -442,6 +442,7 @@ fn activate() -> ExitCode {
 #[cfg(windows)]
 fn run(verbose: bool, interval: Duration) -> ExitCode {
     use crate::backend::stop_signal;
+    use crate::window;
     use crate::hold::{hold, HoldEvent, KEEPALIVE_WRITE_RETRIES};
     use crate::session::{OptionalReply, SessionError};
     use crate::transport::ReadError;
@@ -464,9 +465,12 @@ fn run(verbose: bool, interval: Duration) -> ExitCode {
         &mut session,
         interval,
         last_outbound,
-        &stop_signal::requested,
+        &mut |remaining| {
+            window::wait_interrupt(remaining);
+            stop_signal::requested()
+        },
         &mut |event| match event {
-            HoldEvent::Pinged(reply, drained) => {
+            HoldEvent::Pinged { reply, drained, gap } => {
                 pings += 1;
                 if verbose {
                     let reply = match reply {
@@ -474,7 +478,10 @@ fn run(verbose: bool, interval: Duration) -> ExitCode {
                         OptionalReply::Acknowledged => "acknowledged",
                         OptionalReply::Drained => "reply consumed",
                     };
-                    println!("ping {pings}: {reply}; {drained} unasked frames drained so far");
+                    println!(
+                        "ping {pings}: {reply}; {} ms since the last; {drained} unasked frames drained so far",
+                        gap.as_millis()
+                    );
                 }
             }
             HoldEvent::Retrying { attempt, error } => {

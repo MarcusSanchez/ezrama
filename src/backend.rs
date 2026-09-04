@@ -182,12 +182,18 @@ impl Backend for WindowsBackend {
             &mut session,
             interval,
             last_outbound,
-            &|| window::interrupted() || stop_signal::requested(),
+            &mut |remaining| {
+                window::wait_interrupt(remaining);
+                window::interrupted() || stop_signal::requested()
+            },
             &mut |event| match event {
-                HoldEvent::Pinged(_, drained) => {
+                HoldEvent::Pinged { drained, gap, .. } => {
                     pings += 1;
                     if verbose {
-                        log.log(&format!("ping {pings}; {drained} unasked frames drained so far"));
+                        log.log(&format!(
+                            "ping {pings}: {} ms since the last; {drained} unasked frames drained so far",
+                            gap.as_millis()
+                        ));
                     }
                 }
                 HoldEvent::Retrying { attempt, error } => {

@@ -86,11 +86,22 @@ pub enum ReadStep {
 }
 
 /// Records writes and serves reads from a script.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MockTransport {
     pub writes: Vec<Vec<u8>>,
     write_results: VecDeque<Result<(), WriteError>>,
     reads: VecDeque<ReadStep>,
+    on_timeout: Option<Box<dyn FnMut(Duration)>>,
+}
+
+impl fmt::Debug for MockTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MockTransport")
+            .field("writes", &self.writes)
+            .field("write_results", &self.write_results)
+            .field("reads", &self.reads)
+            .finish()
+    }
 }
 
 impl MockTransport {
@@ -135,6 +146,13 @@ impl MockTransport {
         self
     }
 
+    /// Calls `hook` with the requested timeout whenever a read ends with
+    /// nothing received, so a test clock can pass that time.
+    pub fn on_timeout(&mut self, hook: impl FnMut(Duration) + 'static) -> &mut Self {
+        self.on_timeout = Some(Box::new(hook));
+        self
+    }
+
     /// Scripted reads not yet consumed.
     pub fn pending_reads(&self) -> usize {
         self.reads.len()
@@ -150,15 +168,21 @@ impl Transport for MockTransport {
         self.write_results.pop_front().unwrap_or(Ok(()))
     }
 
-    fn read(&mut self, _timeout: Duration) -> Result<Vec<u8>, ReadError> {
-        if self.reads.front() == Some(&ReadStep::WaitForWrite) {
-            return Ok(Vec::new());
-        }
-        match self.reads.pop_front() {
+    fn read(&mut self, timeout: Duration) -> Result<Vec<u8>, ReadError> {
+        let step = if self.reads.front() == Some(&ReadStep::WaitForWrite) {
+            None
+        } else {
+            self.reads.pop_front()
+        };
+        match step {
             Some(ReadStep::Data(bytes)) => Ok(bytes),
-            Some(ReadStep::Timeout) | None => Ok(Vec::new()),
             Some(ReadStep::Error(error)) => Err(error),
-            Some(ReadStep::WaitForWrite) => Ok(Vec::new()),
+            Some(ReadStep::Timeout) | Some(ReadStep::WaitForWrite) | None => {
+                if let Some(hook) = &mut self.on_timeout {
+                    hook(timeout);
+                }
+                Ok(Vec::new())
+            }
         }
     }
 }

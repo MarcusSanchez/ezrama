@@ -96,6 +96,12 @@ pub fn interrupt_event() -> HANDLE {
     *handle as HANDLE
 }
 
+/// Waits up to `timeout` for the interrupt to be raised. True when it is
+/// raised, at once if it already was; false on timeout.
+pub fn wait_interrupt(timeout: Duration) -> bool {
+    unsafe { WaitForSingleObject(interrupt_event(), wait_millis(timeout)) == WAIT_OBJECT_0 }
+}
+
 /// Clears the interrupt once the pending events have been handled.
 pub fn clear_interrupt() {
     INTERRUPT.store(false, Ordering::SeqCst);
