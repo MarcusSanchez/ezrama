@@ -12,8 +12,9 @@ use crate::overlapped::UsbprintTransport;
 use crate::session::{KeepaliveOutcome, OptionalReply, Session, SessionError};
 use crate::supervisor::{Backend, Hold, Panel, StartError};
 use crate::transport::ReadError;
-use crate::usbprint::{self, Device, Discovery};
+use crate::usbprint::{self, Device, Discovery, WinError};
 use crate::watch::{Event, State};
+use crate::win::{GetCurrentProcess, SetProcessWorkingSetSizeEx};
 use crate::window::{self, PausedSignal};
 
 /// Console control events turn into a stop request for the holding loop
@@ -110,11 +111,25 @@ pub fn establish(
     Ok(session)
 }
 
+/// Lets the system page out whatever this process no longer touches, so
+/// the pages the start-up work needed (device enumeration, the icon, the
+/// bootstrap) do not stay resident for the life of the process.
+pub fn trim_working_set() -> Result<(), WinError> {
+    let trimmed = unsafe {
+        SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, 0)
+    };
+    if trimmed == 0 {
+        return Err(WinError::last("SetProcessWorkingSetSizeEx"));
+    }
+    Ok(())
+}
+
 /// The supervisor's view of this machine.
 pub struct WindowsBackend {
     session: Option<Session<UsbprintTransport>>,
     paused_signal: Option<PausedSignal>,
     kanali: Option<PathBuf>,
+    trimmed: bool,
 }
 
 impl WindowsBackend {
@@ -125,6 +140,7 @@ impl WindowsBackend {
             session: None,
             paused_signal,
             kanali,
+            trimmed: false,
         }
     }
 }
@@ -166,6 +182,12 @@ impl Backend for WindowsBackend {
             .map_err(|error| StartError::Failed(error.to_string()))
             .and_then(|device| establish(device, &mut |line| log.log(line)))?;
         self.session = Some(session);
+        if !self.trimmed {
+            self.trimmed = true;
+            if let Err(error) = trim_working_set() {
+                log.log(&format!("working set not trimmed: {error}"));
+            }
+        }
         Ok(())
     }
 
@@ -245,6 +267,11 @@ mod tests {
             Ok(Panel::Absent) | Ok(Panel::Several(_)) => {}
             Err(error) => panic!("discovery failed: {error}"),
         }
+    }
+
+    #[test]
+    fn the_working_set_can_be_trimmed_without_privileges() {
+        assert_eq!(trim_working_set(), Ok(()));
     }
 
     #[test]

@@ -528,6 +528,13 @@ extern "system" {
     pub fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) -> HANDLE;
     pub fn WaitForMultipleObjects(nCount: DWORD, lpHandles: *const HANDLE, bWaitAll: BOOL, dwMilliseconds: DWORD) -> DWORD;
     pub fn GetCurrentProcessId() -> DWORD;
+    pub fn GetCurrentProcess() -> HANDLE;
+    pub fn SetProcessWorkingSetSizeEx(
+        hProcess: HANDLE,
+        dwMinimumWorkingSetSize: usize,
+        dwMaximumWorkingSetSize: usize,
+        Flags: DWORD,
+    ) -> BOOL;
 }
 
 pub const DETACHED_PROCESS: DWORD = 0x0000_0008;
