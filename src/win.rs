@@ -261,6 +261,9 @@ pub struct OVERLAPPED {
     pub hEvent: HANDLE,
 }
 
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("only 64-bit Windows is supported: the device interface detail size below is the 64-bit value");
+
 /// `cbSize` of `SP_DEVICE_INTERFACE_DETAIL_DATA_W` on 64-bit Windows: the
 /// `DWORD` plus one `WCHAR`, padded to the structure's alignment.
 pub const DEVICE_INTERFACE_DETAIL_CB_SIZE: DWORD = 8;
@@ -514,6 +517,7 @@ extern "system" {
     ) -> HBITMAP;
     pub fn CreateBitmap(nWidth: i32, nHeight: i32, nPlanes: u32, nBitCount: u32, lpBits: *const c_void) -> HBITMAP;
     pub fn DeleteObject(ho: HANDLE) -> BOOL;
+    pub fn GdiFlush() -> BOOL;
 }
 
 #[link(name = "kernel32")]

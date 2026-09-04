@@ -248,12 +248,12 @@ pub fn delete_run_value(name: &str) -> Result<bool, WinError> {
 pub fn run_entries() -> Result<Vec<RunEntry>, WinError> {
     let key = open_run_key(KEY_QUERY_VALUE)?;
     let mut entries = Vec::new();
+    let mut name = vec![0u16; 16_384];
+    let mut data = vec![0u8; 65_536];
     let mut index: DWORD = 0;
     loop {
-        let mut name = vec![0u16; 16_384];
         let mut name_len = name.len() as DWORD;
         let mut kind: DWORD = 0;
-        let mut data = vec![0u8; 65_536];
         let mut data_len = data.len() as DWORD;
         let status = unsafe {
             RegEnumValueW(

@@ -73,9 +73,16 @@ impl Decoder {
         self.buf.len()
     }
 
-    /// Discards everything buffered.
+    /// Discards everything buffered and gives back the room a large frame
+    /// may have taken.
     pub fn clear(&mut self) {
         self.buf.clear();
+        self.buf.shrink_to(MAX_RESYNC_BYTES);
+    }
+
+    /// Bytes of room the buffer holds on to.
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
     }
 
     /// Removes and returns the next complete payload.
@@ -104,6 +111,9 @@ impl Decoder {
         }
         let payload = self.buf[HEADER_LEN..total].to_vec();
         self.buf.drain(..total);
+        if self.buf.is_empty() {
+            self.buf.shrink_to(MAX_RESYNC_BYTES);
+        }
         Ok(Some(payload))
     }
 
@@ -175,6 +185,20 @@ fn discard_before_magic(buf: &mut Vec<u8>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_frame_does_not_pin_its_room() {
+        let mut decoder = Decoder::new();
+        let big = vec![7u8; 4 * MAX_RESYNC_BYTES];
+        decoder.push(&encode(&big).unwrap());
+        assert!(decoder.capacity() >= 4 * MAX_RESYNC_BYTES);
+        assert_eq!(decoder.take_frame().unwrap().as_deref(), Some(big.as_slice()));
+        assert!(decoder.capacity() <= MAX_RESYNC_BYTES);
+        decoder.push(&vec![0u8; 3 * MAX_RESYNC_BYTES]);
+        decoder.clear();
+        assert!(decoder.capacity() <= MAX_RESYNC_BYTES);
+        assert_eq!(decoder.buffered(), 0);
+    }
 
     #[test]
     fn encode_writes_magic_and_little_endian_length() {

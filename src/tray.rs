@@ -94,7 +94,10 @@ pub fn create_icon(image: &Image) -> Result<Icon, WinError> {
         hbmMask: mask,
         hbmColor: color,
     };
-    let handle = unsafe { CreateIconIndirect(&info) };
+    let handle = unsafe {
+        GdiFlush();
+        CreateIconIndirect(&info)
+    };
     let error = WinError::last("CreateIconIndirect");
     unsafe {
         DeleteObject(mask);
