@@ -9,13 +9,34 @@ use std::ptr;
 
 use crate::win::*;
 
-/// USB vendor id of the display.
+/// USB vendor id of the displays.
 pub const VENDOR_ID: u16 = 0x391a;
-/// USB product id of the Panorama SE.
-pub const PRODUCT_ID: u16 = 0x1021;
 
-/// Substring that identifies the display in an interface path.
-const PANORAMA_MARKER: &str = "vid_391a&pid_1021";
+/// A display model this program keeps alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Product {
+    pub id: u16,
+    pub name: &'static str,
+}
+
+/// The models that share the Panorama SE's session start and keepalive:
+/// the SE itself, and the Panorama, which the reference runtime drives
+/// with the same idle protocol.
+pub const PRODUCTS: [Product; 2] = [
+    Product {
+        id: 0x1021,
+        name: "Panorama SE",
+    },
+    Product {
+        id: 0x1011,
+        name: "Panorama",
+    },
+];
+
+/// The substring that identifies `product` in an interface path.
+fn marker(product: &Product) -> String {
+    format!("vid_{VENDOR_ID:04x}&pid_{:04x}", product.id)
+}
 
 /// A failed Win32 call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,9 +300,15 @@ pub fn decode_detail_path(detail: &[u8]) -> String {
     String::from_utf16_lossy(&units)
 }
 
-/// Whether an interface path belongs to a Panorama SE.
+/// The supported model an interface path belongs to, if any.
+pub fn product_of(path: &str) -> Option<&'static Product> {
+    let path = path.to_ascii_lowercase();
+    PRODUCTS.iter().find(|product| path.contains(&marker(product)))
+}
+
+/// Whether an interface path belongs to a supported display.
 pub fn is_panorama_path(path: &str) -> bool {
-    path.to_ascii_lowercase().contains(PANORAMA_MARKER)
+    product_of(path).is_some()
 }
 
 /// Narrows a list of printer-class interface paths to the display.
@@ -348,11 +375,15 @@ mod tests {
     }
 
     #[test]
-    fn marker_match_is_case_insensitive() {
+    fn marker_match_is_case_insensitive_and_names_the_model() {
         assert!(is_panorama_path(r"\\?\USB#VID_391A&PID_1021#abc#{guid}"));
         assert!(is_panorama_path(r"\\?\usb#vid_391a&pid_1021#abc#{guid}"));
-        assert!(!is_panorama_path(r"\\?\usb#vid_391a&pid_1011#abc#{guid}"));
+        assert_eq!(product_of(r"\\?\usb#vid_391a&pid_1021#abc#{guid}").map(|p| p.name), Some("Panorama SE"));
+        assert_eq!(product_of(r"\\?\USB#VID_391A&PID_1011#abc#{guid}").map(|p| p.name), Some("Panorama"));
+        assert!(!is_panorama_path(r"\\?\usb#vid_391a&pid_2011#turris#{guid}"));
+        assert!(!is_panorama_path(r"\\?\usb#vid_391a&pid_0006#gadget#{guid}"));
         assert!(!is_panorama_path(r"\\?\usb#vid_04b8&pid_0005#printer#{guid}"));
+        assert_eq!(marker(&PRODUCTS[0]), "vid_391a&pid_1021");
     }
 
     #[test]

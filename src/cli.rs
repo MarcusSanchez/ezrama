@@ -10,7 +10,7 @@ const USAGE: &str = "\
 Usage: ezrama <command> [options]
 
 Commands:
-  probe      Find the Panorama SE printer interface and open it briefly
+  probe      Find the display's printer interface and open it briefly
   info       Start a session and print the device's state; changes nothing
   activate   Start a session and switch the panel to its stored media once
   run        Start a session and hold it with keepalive pings until Ctrl+C
@@ -196,15 +196,15 @@ mod win_cli {
     pub fn locate() -> Result<String, ExitCode> {
         match usbprint::find_panorama() {
             Ok(Discovery::One(path)) => {
-                println!("Panorama SE: {path}");
+                println!("{}: {path}", usbprint::product_of(&path).map_or("display", |p| p.name));
                 Ok(path)
             }
             Ok(Discovery::Absent) => {
-                eprintln!("no Panorama SE printer interface is present");
+                eprintln!("no Panorama or Panorama SE printer interface is present");
                 Err(ExitCode::from(1))
             }
             Ok(Discovery::Several(paths)) => {
-                eprintln!("{} Panorama SE printer interfaces are present:", paths.len());
+                eprintln!("{} Panorama printer interfaces are present:", paths.len());
                 for path in &paths {
                     eprintln!("  {path}");
                 }
@@ -795,7 +795,7 @@ fn install() -> ExitCode {
                 &installed_watcher,
                 "watch",
                 &icon,
-                "Keeps the Panorama SE showing its media",
+                "Keeps the Panorama showing its media",
             );
             match written {
                 Ok(()) => println!("Start Menu entry {}", link.display()),

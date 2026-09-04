@@ -1,9 +1,21 @@
 # ezrama
 
-Keeps a TRYX Panorama SE cooler display showing its stored media on Windows
+Keeps a TRYX Panorama cooler display showing its stored media on Windows
 without the KANALI application running. One small process, one keepalive
 every 4.5 seconds, no sensor reads, no dependencies. KANALI stays the tool
 for choosing media; ezrama shows whatever it last stored on the panel.
+
+## Supported displays
+
+| Display | USB id | Status |
+|---|---|---|
+| Panorama SE (ARGB 240 / 360) | `391a:1021` | Tested on real hardware |
+| Panorama (240 / 280 / 360, ARGB) | `391a:1011` | Expected to work, untested: the reference runtime drives it with the same session start and keepalive |
+| Turris 620 | `391a:2011` | Not supported: the reference runtime sends it no keepalive, so there is nothing known for ezrama to do |
+
+If you run a Panorama and it works, or does not, an issue with the log
+from `%LOCALAPPDATA%\ezrama\ezrama.log` is the fastest way to move it into
+the tested row.
 
 ## Install
 
@@ -42,7 +54,7 @@ process watcher is the kind of background polling ezrama exists to avoid.
 ## Commands
 
 ```
-ezrama probe      Find the Panorama SE printer interface and open it briefly
+ezrama probe      Find the display's printer interface and open it briefly
 ezrama info       Start a session and print the device's state; changes nothing
 ezrama activate   Start a session and switch the panel to its stored media once
 ezrama run        Start a session and hold it with keepalive pings until Ctrl+C
