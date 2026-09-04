@@ -37,6 +37,8 @@ Options:
 const EXIT_BUSY: u8 = 4;
 /// Exit code when more than one display is present.
 const EXIT_SEVERAL: u8 = 3;
+/// Exit code when `watch` finds a watcher already running.
+const EXIT_ALREADY_RUNNING: u8 = 5;
 /// How long `pause` waits for the watcher to confirm the release.
 const PAUSE_CONFIRMATION: Duration = Duration::from_secs(5);
 /// How long `install` and `uninstall` wait for a stopped watcher to exit;
@@ -525,6 +527,10 @@ fn watch(verbose: bool, interval: Duration) -> ExitCode {
         Some(path) => Logger::to_file(&path, true),
         None => Logger::stdout(),
     };
+    if let Some(id) = window::watcher_process_id() {
+        log.log(&format!("a watcher is already running as process {id}; nothing to do"));
+        return ExitCode::from(EXIT_ALREADY_RUNNING);
+    }
     log.log(&format!(
         "watch starting: {NAME} {VERSION}, ping interval {} ms",
         interval.as_millis()
@@ -730,6 +736,13 @@ fn install() -> ExitCode {
     } else {
         println!("already running from {}", directory.display());
     }
+    match write_icon(&directory) {
+        Ok(path) => println!("wrote {}", path.display()),
+        Err(error) => {
+            eprintln!("cannot write the icon file: {error}");
+            return ExitCode::from(1);
+        }
+    }
 
     let command = run_command(&installed_watcher);
     if let Err(error) = set_run_value(RUN_VALUE, &command) {
@@ -786,7 +799,7 @@ fn uninstall() -> ExitCode {
         return ExitCode::from(1);
     };
     let mut failed = false;
-    for name in [CONSOLE_BINARY, WATCHER_BINARY] {
+    for name in [CONSOLE_BINARY, WATCHER_BINARY, ICON_FILE] {
         let path = directory.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => println!("deleted {}", path.display()),

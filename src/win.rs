@@ -461,6 +461,21 @@ extern "system" {
     pub fn Shell_NotifyIconW(dwMessage: DWORD, lpData: *mut NOTIFYICONDATAW) -> BOOL;
 }
 
+pub const IMAGE_ICON: u32 = 1;
+pub const LR_LOADFROMFILE: u32 = 0x0010;
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn LoadImageW(
+        hInst: HANDLE,
+        name: *const u16,
+        r#type: u32,
+        cx: i32,
+        cy: i32,
+        fuLoad: u32,
+    ) -> HANDLE;
+}
+
 #[link(name = "user32")]
 extern "system" {
     pub fn GetSystemMetrics(nIndex: i32) -> i32;

@@ -16,6 +16,9 @@ pub const RUN_VALUE: &str = "ezrama";
 pub const CONSOLE_BINARY: &str = "ezrama.exe";
 /// File name of the windowless binary that the Run entry starts.
 pub const WATCHER_BINARY: &str = "ezramaw.exe";
+/// File name of the icon written next to the binaries for the shortcut
+/// and the installed-apps entry.
+pub const ICON_FILE: &str = "ezrama.ico";
 
 /// The per-user installation directory, `%LOCALAPPDATA%\ezrama`.
 pub fn install_dir() -> Option<PathBuf> {
@@ -311,6 +314,15 @@ pub fn copy_binary(source: &Path, destination: &Path) -> std::io::Result<u64> {
         fs::create_dir_all(directory)?;
     }
     fs::copy(source, destination)
+}
+
+/// Writes the program's icon as [`ICON_FILE`] in `directory`, creating the
+/// directory, and returns the file's path.
+pub fn write_icon(directory: &Path) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(directory)?;
+    let path = directory.join(ICON_FILE);
+    fs::write(&path, crate::icon::ico_bytes(&crate::icon::Image::embedded()))?;
+    Ok(path)
 }
 
 

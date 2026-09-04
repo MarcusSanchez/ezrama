@@ -429,6 +429,33 @@ mod tests {
         assert_eq!(back.pixels, Image::embedded().resample(small_icon_size()).pixels);
     }
 
+    /// The icon file written for the shortcut loads back through the shell
+    /// with its alpha intact; opaque pixels survive exactly.
+    #[test]
+    fn the_icon_file_loads_back_through_the_shell() {
+        let image = Image::embedded();
+        let path = std::env::temp_dir().join(format!("ezrama-icon-test-{}.ico", std::process::id()));
+        std::fs::write(&path, icon::ico_bytes(&image)).unwrap();
+        let file = crate::usbprint::wide_path(&path);
+        let side = image.size as i32;
+        let loaded = unsafe {
+            LoadImageW(ptr::null_mut(), file.as_ptr(), IMAGE_ICON, side, side, LR_LOADFROMFILE)
+        };
+        std::fs::remove_file(&path).unwrap();
+        assert!(!loaded.is_null());
+        let back = icon_pixels(loaded).unwrap();
+        unsafe {
+            DestroyIcon(loaded);
+        }
+        assert_eq!(back.size, image.size);
+        for (index, (&loaded, &original)) in back.pixels.iter().zip(&image.pixels).enumerate() {
+            assert_eq!(icon::alpha(loaded), icon::alpha(original), "alpha at {index}");
+            if icon::alpha(original) == 255 {
+                assert_eq!(loaded, original, "opaque pixel at {index}");
+            }
+        }
+    }
+
     #[test]
     fn menus_are_created_and_destroyed() {
         let menu = Menu::new().unwrap();
