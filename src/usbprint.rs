@@ -3,6 +3,8 @@
 use std::ffi::c_void;
 use std::fmt;
 use std::mem;
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 use std::ptr;
 
 use crate::win::*;
@@ -154,6 +156,12 @@ pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// A NUL-terminated UTF-16 copy of a path, unit for unit, so a name the
+/// file system holds as unpaired surrogates reaches the system unchanged.
+pub fn wide_path(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+
 /// Outcome of looking for the display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Discovery {
@@ -284,6 +292,17 @@ pub fn find_panorama() -> Result<Discovery, WinError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    #[test]
+    fn wide_paths_keep_unpaired_surrogates() {
+        let units = [u16::from(b'a'), 0xd800, u16::from(b'b')];
+        let path = std::path::PathBuf::from(OsString::from_wide(&units));
+        assert_eq!(wide_path(&path), vec![u16::from(b'a'), 0xd800, u16::from(b'b'), 0]);
+        assert_ne!(wide(&path.to_string_lossy())[1], 0xd800);
+        assert_eq!(wide_path(Path::new(r"C:\sub")), wide(r"C:\sub"));
+    }
 
     fn detail_buffer(path: &str, trailing: &[u8]) -> Vec<u8> {
         let mut bytes = DEVICE_INTERFACE_DETAIL_CB_SIZE.to_le_bytes().to_vec();

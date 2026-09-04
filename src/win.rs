@@ -64,6 +64,7 @@ pub const DEVICE_NOTIFY_WINDOW_HANDLE: DWORD = 0;
 pub const EVENT_MODIFY_STATE: DWORD = 0x0002;
 pub const SYNCHRONIZE: DWORD = 0x0010_0000;
 pub const ERROR_ALREADY_EXISTS: DWORD = 183;
+pub const ERROR_CLASS_ALREADY_EXISTS: DWORD = 1410;
 
 pub type HKEY = *mut c_void;
 pub type LSTATUS = i32;
@@ -73,6 +74,7 @@ pub const HKEY_LOCAL_MACHINE: HKEY = 0x8000_0002usize as HKEY;
 pub const KEY_QUERY_VALUE: DWORD = 0x0001;
 pub const KEY_SET_VALUE: DWORD = 0x0002;
 pub const REG_SZ: DWORD = 1;
+pub const REG_EXPAND_SZ: DWORD = 2;
 pub const ERROR_SUCCESS: LSTATUS = 0;
 pub const ERROR_MORE_DATA: LSTATUS = 234;
 
@@ -344,6 +346,7 @@ extern "system" {
     pub fn SetConsoleCtrlHandler(HandlerRoutine: PHANDLER_ROUTINE, Add: BOOL) -> BOOL;
     pub fn GetModuleHandleW(lpModuleName: *const u16) -> HANDLE;
     pub fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
+    pub fn ExpandEnvironmentStringsW(lpSrc: *const u16, lpDst: *mut u16, nSize: DWORD) -> DWORD;
     pub fn OpenEventW(dwDesiredAccess: DWORD, bInheritHandle: BOOL, lpName: *const u16) -> HANDLE;
     pub fn SetEvent(hEvent: HANDLE) -> BOOL;
     pub fn ResetEvent(hEvent: HANDLE) -> BOOL;

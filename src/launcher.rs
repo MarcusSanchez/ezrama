@@ -3,6 +3,7 @@
 //! handing over to a fresh process of its own.
 
 use std::mem;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::thread;
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use crate::install::read_string;
 use crate::overlapped::wait_millis;
-use crate::usbprint::{wide, WinError};
+use crate::usbprint::{wide_path, WinError};
 use crate::win::*;
 
 /// File name of KANALI's executable.
@@ -76,9 +77,13 @@ pub fn start_detached(
     arguments: &str,
     directory: Option<&Path>,
 ) -> Result<Process, WinError> {
-    let application = wide(&program.to_string_lossy());
-    let mut command_line = wide(&format!("\"{}\" {arguments}", program.display()));
-    let directory = directory.map(|directory| wide(&directory.to_string_lossy()));
+    let application = wide_path(program);
+    let mut command_line: Vec<u16> = std::iter::once(u16::from(b'"'))
+        .chain(program.as_os_str().encode_wide())
+        .chain(format!("\" {arguments}").encode_utf16())
+        .chain(std::iter::once(0))
+        .collect();
+    let directory = directory.map(wide_path);
     let mut startup: STARTUPINFOW = unsafe { mem::zeroed() };
     startup.cb = mem::size_of::<STARTUPINFOW>() as DWORD;
     let mut information: PROCESS_INFORMATION = unsafe { mem::zeroed() };
@@ -190,7 +195,10 @@ fn wait_all(pids: &[u32]) {
 /// Blocks until no process named `name` is left. A program that starts and
 /// hands over to a fresh process of its own may leave a gap; the first
 /// look is repeated [`HANDOVER_CHECKS`] times, [`HANDOVER_GRACE`] apart,
-/// before an empty result counts.
+/// before an empty result counts. Once a process has been seen, an empty
+/// result counts at once: KANALI hands over exactly once, within a third
+/// of a second, and repeating the grace after every wait would delay each
+/// resume by the full grace for a second hand-over that does not happen.
 pub fn wait_for_processes_named(name: &str) {
     let mut checks = HANDOVER_CHECKS;
     loop {

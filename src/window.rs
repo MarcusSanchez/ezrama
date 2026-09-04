@@ -460,7 +460,7 @@ pub fn run_message_loop(sender: Sender<Event>, setup: Setup) -> Result<(), WinEr
     };
     if unsafe { RegisterClassW(&class) } == 0 {
         let error = WinError::last("RegisterClassW");
-        if error.code != 1410 {
+        if error.code != ERROR_CLASS_ALREADY_EXISTS {
             return Err(error);
         }
     }

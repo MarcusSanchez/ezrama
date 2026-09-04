@@ -80,6 +80,8 @@ enum Completion {
 enum Waited {
     Timeout,
     Interrupted,
+    /// The wait itself failed; the read is still armed.
+    Failed(WinError),
     Completed(Completion),
 }
 
@@ -286,6 +288,9 @@ impl UsbprintTransport {
         if self.interrupt.is_some() && waited == WAIT_OBJECT_0 + 1 {
             return Waited::Interrupted;
         }
+        if waited == WAIT_FAILED {
+            return Waited::Failed(WinError::last("WaitForSingleObject"));
+        }
         if waited != WAIT_OBJECT_0 {
             return Waited::Timeout;
         }
@@ -370,6 +375,7 @@ impl Transport for UsbprintTransport {
             match self.wait_read(remaining) {
                 Waited::Timeout => return Ok(Vec::new()),
                 Waited::Interrupted => return Err(ReadError::Interrupted),
+                Waited::Failed(error) => return Err(ReadError::Failed(error.to_string())),
                 Waited::Completed(completion) => {
                     let queued = self.apply_read_completion(completion)?;
                     if queued > 0 {

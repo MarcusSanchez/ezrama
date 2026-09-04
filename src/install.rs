@@ -167,7 +167,37 @@ pub fn read_string(root: HKEY, subkey: &str, name: &str) -> Result<Option<String
             code: status as DWORD,
         });
     }
-    Ok(Some(utf16_string(&data[..size as usize])))
+    Ok(Some(registry_string(kind, &data[..size as usize])))
+}
+
+/// A string value as stored: expandable strings have their `%NAME%`
+/// references replaced from the environment.
+fn registry_string(kind: DWORD, bytes: &[u8]) -> String {
+    let text = utf16_string(bytes);
+    if kind == REG_EXPAND_SZ {
+        expand_environment(&text)
+    } else {
+        text
+    }
+}
+
+/// Replaces `%NAME%` references with the environment's values, as the
+/// shell does for expandable registry strings. Unknown names stay as they
+/// are.
+pub fn expand_environment(text: &str) -> String {
+    let source = wide(text);
+    let needed = unsafe { ExpandEnvironmentStringsW(source.as_ptr(), ptr::null_mut(), 0) };
+    if needed == 0 {
+        return text.to_string();
+    }
+    let mut buffer = vec![0u16; needed as usize];
+    let written =
+        unsafe { ExpandEnvironmentStringsW(source.as_ptr(), buffer.as_mut_ptr(), needed) };
+    if written == 0 || written > needed {
+        return text.to_string();
+    }
+    let end = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..end])
 }
 
 /// Writes the string value `name` under the Run key.
@@ -248,8 +278,8 @@ pub fn run_entries() -> Result<Vec<RunEntry>, WinError> {
             });
         }
         let name = String::from_utf16_lossy(&name[..name_len as usize]);
-        let command = if kind == REG_SZ {
-            utf16_string(&data[..(data_len as usize).min(data.len())])
+        let command = if kind == REG_SZ || kind == REG_EXPAND_SZ {
+            registry_string(kind, &data[..(data_len as usize).min(data.len())])
         } else {
             String::new()
         };
@@ -311,6 +341,18 @@ mod tests {
         bytes.extend_from_slice(&[0, 0, b'z', 0]);
         assert_eq!(utf16_string(&bytes), "ab");
         assert_eq!(utf16_string(&[]), "");
+    }
+
+    #[test]
+    fn expandable_strings_take_values_from_the_environment() {
+        let root = std::env::var("SystemRoot").unwrap();
+        assert_eq!(expand_environment(r"%SystemRoot%\sub"), format!(r"{root}\sub"));
+        assert_eq!(expand_environment("plain"), "plain");
+        assert_eq!(expand_environment("%ezrama_no_such_name%"), "%ezrama_no_such_name%");
+        assert_eq!(expand_environment(""), "");
+        let bytes: Vec<u8> = "%SystemRoot%".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(registry_string(REG_EXPAND_SZ, &bytes), root);
+        assert_eq!(registry_string(REG_SZ, &bytes), "%SystemRoot%");
     }
 
     #[test]
