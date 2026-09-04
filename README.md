@@ -7,29 +7,33 @@ for choosing media; ezrama shows whatever it last stored on the panel.
 
 ## Install
 
-With a stable Rust toolchain:
+Download the zip from the releases page, or build from source with a
+stable Rust toolchain, then run the installer once:
 
 ```
 cargo build --release
 target\release\ezrama.exe install
 ```
 
-This copies the binaries to `%LOCALAPPDATA%\ezrama`, adds a logon entry for
-the windowless watcher, and starts it. Turn off "start with Windows" in
-KANALI's own settings, or the two race for the panel at logon. `ezrama uninstall`
-reverses it.
+This copies the program to `%LOCALAPPDATA%\ezrama`, starts it, and adds
+three things: a logon entry so it starts with Windows, a Start Menu entry
+named ezrama for getting it back after a Quit, and an entry under
+Settings > Apps whose Uninstall removes everything again. Turn off "start
+with Windows" in KANALI's own settings, or the two race for the panel at
+logon.
 
-The watcher shows a tray icon with the current status and a menu: Pause,
-Resume, Open KANALI, Quit.
+While it runs, ezrama sits in the notification area. Its menu shows the
+current status and offers Pause, Resume, Open KANALI, and Quit.
 
 ## Running alongside KANALI
 
-Both can talk to the panel at once, and viewing works, but uploads stall
-partway and the panel stays stuck until KANALI is closed and reopened. To
-change media, use **Open KANALI** from the tray icon or `ezrama kanali`:
-ezrama releases the panel, starts KANALI, and takes the panel back when
-KANALI exits. If you start KANALI some other way, `ezrama pause` first and
-`ezrama resume` after; ezrama only knows about the copy it started itself.
+KANALI and ezrama can run at the same time. Be cautious with uploads: a
+media upload can stall while ezrama is also talking to the panel, so pause
+ezrama from the tray before uploading and resume it after, or use Open
+KANALI from the tray, which does that for you and takes the panel back when
+KANALI closes. ezrama does not watch for KANALI on its own. That is
+deliberate: a process watcher is the kind of background polling ezrama
+exists to avoid.
 
 ## Commands
 
@@ -44,8 +48,9 @@ ezrama resume     Ask the running watcher to take the panel back
 ezrama kanali     Ask the running watcher to release the panel, start KANALI,
                   and take the panel back once KANALI exits
 ezrama stop       Ask the running watcher to exit
-ezrama install    Copy the binaries to local app data, start the watcher at logon
-ezrama uninstall  Stop the watcher and remove the logon entry and the binaries
+ezrama install    Copy the binaries to local app data, add the logon, Start
+                  Menu, and Settings entries, and start the watcher
+ezrama uninstall  Stop the watcher and remove everything install added
 ezrama status     Report the installation, the watcher, and the panel
 ```
 
@@ -54,8 +59,8 @@ ezrama status     Report the installation, the watcher, and the panel
 panel blanks after five seconds of silence, so stay under that.
 
 `ezrama.exe` is the console binary. `ezramaw.exe` is the same program built
-without a console, which is what the logon entry runs. The watcher logs to
-`%LOCALAPPDATA%\ezrama\ezrama.log`.
+without a console, which is what the logon and Start Menu entries run. The
+watcher logs to `%LOCALAPPDATA%\ezrama\ezrama.log`, which uninstall keeps.
 
 ## Footprint
 

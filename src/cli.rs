@@ -20,8 +20,9 @@ Commands:
   kanali     Ask the running watcher to release the panel, start KANALI, and
              take the panel back once KANALI exits
   stop       Ask the running watcher to exit
-  install    Copy the binaries to local app data, start the watcher at logon
-  uninstall  Stop the watcher and remove the logon entry and the binaries
+  install    Copy the binaries to local app data, add the logon, Start Menu,
+             and Settings entries, and start the watcher
+  uninstall  Stop the watcher and remove everything install added
   status     Report the installation, the watcher, and the panel
   help       Show this message
   version    Print the version
@@ -44,6 +45,9 @@ const PAUSE_CONFIRMATION: Duration = Duration::from_secs(5);
 /// How long `install` and `uninstall` wait for a stopped watcher to exit;
 /// a session start attempt can hold it for the readiness deadline.
 const STOP_CONFIRMATION: Duration = Duration::from_secs(30);
+/// How long `uninstall`, when run from the installed copy, gives itself to
+/// exit before its own executable is deleted.
+const SELF_REMOVAL_DELAY_SECONDS: u32 = 3;
 
 /// A request for a running watcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -774,6 +778,28 @@ fn install() -> ExitCode {
     }
     println!("logon entry {RUN_VALUE}: {command}");
 
+    let size_kb = [CONSOLE_BINARY, WATCHER_BINARY, ICON_FILE]
+        .iter()
+        .filter_map(|name| std::fs::metadata(directory.join(name)).ok())
+        .map(|metadata| metadata.len())
+        .sum::<u64>()
+        .div_ceil(1024) as u32;
+    let entry = UninstallEntry {
+        display_name: NAME.to_string(),
+        version: VERSION.to_string(),
+        icon: icon.clone(),
+        location: directory.clone(),
+        uninstall_command: format!("\"{}\" uninstall", installed_console.display()),
+        size_kb,
+    };
+    match write_uninstall_entry(UNINSTALL_SUBKEY, &entry) {
+        Ok(()) => println!("listed in Settings under Apps as {NAME} {VERSION}"),
+        Err(error) => {
+            eprintln!("cannot write the installed-apps entry: {error}");
+            return ExitCode::from(1);
+        }
+    }
+
     match kanali_run_entries() {
         Ok(entries) if !entries.is_empty() => {
             for entry in &entries {
@@ -804,6 +830,7 @@ fn install() -> ExitCode {
 #[cfg(windows)]
 fn uninstall() -> ExitCode {
     use crate::install::*;
+    use crate::launcher;
     use crate::log::default_log_path;
     use crate::shortcut;
 
@@ -833,7 +860,15 @@ fn uninstall() -> ExitCode {
             }
         }
     }
-    for name in [CONSOLE_BINARY, WATCHER_BINARY, ICON_FILE] {
+    match delete_uninstall_entry(UNINSTALL_SUBKEY) {
+        Ok(true) => println!("removed the Settings entry"),
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("cannot remove the Settings entry: {error}");
+            failed = true;
+        }
+    }
+    for name in [WATCHER_BINARY, ICON_FILE] {
         let path = directory.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => println!("deleted {}", path.display()),
@@ -847,6 +882,32 @@ fn uninstall() -> ExitCode {
     if let Some(log) = default_log_path() {
         if log.exists() {
             println!("log kept at {}", log.display());
+        }
+    }
+    let console = directory.join(CONSOLE_BINARY);
+    let running_installed = std::env::current_exe()
+        .map(|own| own.to_string_lossy().eq_ignore_ascii_case(&console.to_string_lossy()))
+        .unwrap_or(false);
+    if running_installed {
+        let own = std::slice::from_ref(&console);
+        match launcher::remove_after_exit(own, &directory, SELF_REMOVAL_DELAY_SECONDS) {
+            Ok(_) => println!("this program removes itself in a few seconds"),
+            Err(error) => {
+                eprintln!("cannot arrange the removal of {}: {error}", console.display());
+                failed = true;
+            }
+        }
+    } else {
+        match std::fs::remove_file(&console) {
+            Ok(()) => {
+                println!("deleted {}", console.display());
+                let _ = std::fs::remove_dir(&directory);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!("cannot delete {}: {error}", console.display());
+                failed = true;
+            }
         }
     }
     if failed {
@@ -884,6 +945,11 @@ fn status() -> ExitCode {
     match shortcut::start_menu_path() {
         Some(link) if link.exists() => println!("start menu   {}", link.display()),
         _ => println!("start menu   none"),
+    }
+    match uninstall_command(UNINSTALL_SUBKEY) {
+        Ok(Some(command)) => println!("settings     listed; uninstall runs {command}"),
+        Ok(None) => println!("settings     not listed"),
+        Err(error) => println!("settings     unreadable: {error}"),
     }
     match kanali_run_entries() {
         Ok(entries) if entries.is_empty() => println!("kanali       no startup entry"),

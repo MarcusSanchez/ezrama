@@ -73,13 +73,28 @@ pub const HKEY_CURRENT_USER: HKEY = 0x8000_0001usize as HKEY;
 pub const HKEY_LOCAL_MACHINE: HKEY = 0x8000_0002usize as HKEY;
 pub const KEY_QUERY_VALUE: DWORD = 0x0001;
 pub const KEY_SET_VALUE: DWORD = 0x0002;
+pub const KEY_WRITE: DWORD = 0x0002_0006;
 pub const REG_SZ: DWORD = 1;
 pub const REG_EXPAND_SZ: DWORD = 2;
+pub const REG_DWORD: DWORD = 4;
+pub const REG_OPTION_NON_VOLATILE: DWORD = 0;
 pub const ERROR_SUCCESS: LSTATUS = 0;
 pub const ERROR_MORE_DATA: LSTATUS = 234;
 
 #[link(name = "advapi32")]
 extern "system" {
+    pub fn RegCreateKeyExW(
+        hKey: HKEY,
+        lpSubKey: *const u16,
+        Reserved: DWORD,
+        lpClass: *const u16,
+        dwOptions: DWORD,
+        samDesired: DWORD,
+        lpSecurityAttributes: *mut c_void,
+        phkResult: *mut HKEY,
+        lpdwDisposition: *mut DWORD,
+    ) -> LSTATUS;
+    pub fn RegDeleteKeyW(hKey: HKEY, lpSubKey: *const u16) -> LSTATUS;
     pub fn RegOpenKeyExW(
         hKey: HKEY,
         lpSubKey: *const u16,

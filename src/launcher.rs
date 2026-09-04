@@ -113,6 +113,25 @@ pub fn start_detached(
     })
 }
 
+/// Arranges for `files` to be deleted, and then `directory` removed if it
+/// is empty, about `delay_seconds` after this call, by a detached command
+/// interpreter that outlives this process. This is how a program removes
+/// its own running executable: Windows will not delete it while it runs.
+pub fn remove_after_exit(
+    files: &[PathBuf],
+    directory: &Path,
+    delay_seconds: u32,
+) -> Result<Process, WinError> {
+    let system = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_default();
+    let interpreter = system.join("System32").join("cmd.exe");
+    let mut script = format!("/d /c ping -n {} 127.0.0.1 >nul", delay_seconds + 1);
+    for file in files {
+        script.push_str(&format!(" & del /q \"{}\"", file.display()));
+    }
+    script.push_str(&format!(" & rmdir \"{}\"", directory.display()));
+    start_detached(&interpreter, &script, None)
+}
+
 /// A `DisplayIcon` value is a path, possibly quoted, possibly followed by
 /// a comma and an icon index.
 pub fn icon_source_path(value: &str) -> &str {
@@ -239,6 +258,22 @@ mod tests {
         assert!(Process::open(0).is_err());
         let missing = start_detached(Path::new(r"C:\ezrama-no-such-program.exe"), "", None);
         assert_eq!(missing.err().map(|error| error.code), Some(ERROR_FILE_NOT_FOUND));
+    }
+
+    #[test]
+    fn files_are_removed_after_a_delay_by_a_detached_interpreter() {
+        let directory = std::env::temp_dir().join(format!("ezrama-remove-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("one.bin");
+        let second = directory.join("two.bin");
+        std::fs::write(&first, b"1").unwrap();
+        std::fs::write(&second, b"2").unwrap();
+        let cleaner = remove_after_exit(&[first.clone(), second.clone()], &directory, 1).unwrap();
+        assert!(first.exists(), "nothing is deleted before the delay");
+        assert!(cleaner.wait_for(Duration::from_secs(15)), "the interpreter finishes");
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert!(!directory.exists(), "an emptied directory is removed too");
     }
 
     #[test]

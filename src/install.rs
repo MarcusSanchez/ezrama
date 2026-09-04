@@ -316,6 +316,124 @@ pub fn copy_binary(source: &Path, destination: &Path) -> std::io::Result<u64> {
     fs::copy(source, destination)
 }
 
+/// Registry key whose subkeys are the current user's installed programs,
+/// as Settings lists them.
+pub const UNINSTALL_ROOT: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall";
+/// ezrama's subkey under [`UNINSTALL_ROOT`].
+pub const UNINSTALL_SUBKEY: &str = "ezrama";
+
+/// What the installed-apps entry says about the program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UninstallEntry {
+    pub display_name: String,
+    pub version: String,
+    pub icon: PathBuf,
+    pub location: PathBuf,
+    /// The command Settings runs to remove the program.
+    pub uninstall_command: String,
+    pub size_kb: u32,
+}
+
+/// The installed-apps key for `subkey` under [`UNINSTALL_ROOT`].
+fn uninstall_key(subkey: &str) -> String {
+    format!(r"{UNINSTALL_ROOT}\{subkey}")
+}
+
+fn set_string(key: HKEY, name: &str, value: &str) -> Result<(), WinError> {
+    let name = wide(name);
+    let data = wide(value);
+    let status = unsafe {
+        RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_SZ,
+            data.as_ptr() as *const u8,
+            (data.len() * 2) as DWORD,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(WinError {
+            call: "RegSetValueExW",
+            code: status as DWORD,
+        });
+    }
+    Ok(())
+}
+
+fn set_dword(key: HKEY, name: &str, value: u32) -> Result<(), WinError> {
+    let name = wide(name);
+    let data = value.to_le_bytes();
+    let status = unsafe {
+        RegSetValueExW(key, name.as_ptr(), 0, REG_DWORD, data.as_ptr(), data.len() as DWORD)
+    };
+    if status != ERROR_SUCCESS {
+        return Err(WinError {
+            call: "RegSetValueExW",
+            code: status as DWORD,
+        });
+    }
+    Ok(())
+}
+
+/// Creates or replaces the installed-apps entry `subkey`, so Settings
+/// lists the program with a working Uninstall.
+pub fn write_uninstall_entry(subkey: &str, entry: &UninstallEntry) -> Result<(), WinError> {
+    let path = wide(&uninstall_key(subkey));
+    let mut key: HKEY = ptr::null_mut();
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            path.as_ptr(),
+            0,
+            ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            ptr::null_mut(),
+            &mut key,
+            ptr::null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(WinError {
+            call: "RegCreateKeyExW",
+            code: status as DWORD,
+        });
+    }
+    let written = set_string(key, "DisplayName", &entry.display_name)
+        .and_then(|()| set_string(key, "DisplayVersion", &entry.version))
+        .and_then(|()| set_string(key, "DisplayIcon", &entry.icon.to_string_lossy()))
+        .and_then(|()| set_string(key, "InstallLocation", &entry.location.to_string_lossy()))
+        .and_then(|()| set_string(key, "UninstallString", &entry.uninstall_command))
+        .and_then(|()| set_dword(key, "NoModify", 1))
+        .and_then(|()| set_dword(key, "NoRepair", 1))
+        .and_then(|()| set_dword(key, "EstimatedSize", entry.size_kb));
+    unsafe { RegCloseKey(key) };
+    written
+}
+
+/// Removes the installed-apps entry `subkey`. Returns whether it existed.
+pub fn delete_uninstall_entry(subkey: &str) -> Result<bool, WinError> {
+    let path = wide(&uninstall_key(subkey));
+    let status = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, path.as_ptr()) };
+    if status as DWORD == ERROR_FILE_NOT_FOUND {
+        return Ok(false);
+    }
+    if status != ERROR_SUCCESS {
+        return Err(WinError {
+            call: "RegDeleteKeyW",
+            code: status as DWORD,
+        });
+    }
+    Ok(true)
+}
+
+/// The command Settings runs for the installed-apps entry `subkey`, if
+/// the entry exists.
+pub fn uninstall_command(subkey: &str) -> Result<Option<String>, WinError> {
+    read_string(HKEY_CURRENT_USER, &uninstall_key(subkey), "UninstallString")
+}
+
 /// Writes the program's icon as [`ICON_FILE`] in `directory`, creating the
 /// directory, and returns the file's path.
 pub fn write_icon(directory: &Path) -> std::io::Result<PathBuf> {
@@ -365,6 +483,29 @@ mod tests {
         let bytes: Vec<u8> = "%SystemRoot%".encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert_eq!(registry_string(REG_EXPAND_SZ, &bytes), root);
         assert_eq!(registry_string(REG_SZ, &bytes), "%SystemRoot%");
+    }
+
+    #[test]
+    fn an_installed_apps_entry_round_trips_and_deletes() {
+        let subkey = format!("ezrama-test-{}", std::process::id());
+        let entry = UninstallEntry {
+            display_name: "ezrama test".to_string(),
+            version: "0.0.0".to_string(),
+            icon: PathBuf::from(r"C:\ezrama-test\ezrama.ico"),
+            location: PathBuf::from(r"C:\ezrama-test"),
+            uninstall_command: r#""C:\ezrama-test\ezrama.exe" uninstall"#.to_string(),
+            size_kb: 840,
+        };
+        assert_eq!(uninstall_command(&subkey), Ok(None));
+        write_uninstall_entry(&subkey, &entry).unwrap();
+        assert_eq!(uninstall_command(&subkey), Ok(Some(entry.uninstall_command.clone())));
+        assert_eq!(
+            read_string(HKEY_CURRENT_USER, &uninstall_key(&subkey), "DisplayName"),
+            Ok(Some("ezrama test".to_string()))
+        );
+        assert_eq!(delete_uninstall_entry(&subkey), Ok(true));
+        assert_eq!(delete_uninstall_entry(&subkey), Ok(false));
+        assert_eq!(uninstall_command(&subkey), Ok(None));
     }
 
     #[test]
