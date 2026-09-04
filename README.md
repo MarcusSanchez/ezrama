@@ -59,9 +59,10 @@ without a console, which is what the logon entry runs. The watcher logs to
 
 ## Footprint
 
-One process, about 8 MB of memory, idle except for one small USB write
-every 4.5 seconds. Device arrival, removal, sleep, and resume are handled
-through Windows notifications, not polling.
+One process, under a megabyte resident and a few megabytes committed,
+idle except for one small USB write every 4.5 seconds, waking once per
+write. Device arrival, removal, sleep, and resume are handled through
+Windows notifications, not polling.
 
 ## Thanks
 
