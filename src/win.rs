@@ -599,3 +599,91 @@ extern "system" {
         lpProcessInformation: *mut PROCESS_INFORMATION,
     ) -> BOOL;
 }
+
+pub type HRESULT = i32;
+
+pub const S_OK: HRESULT = 0;
+pub const S_FALSE: HRESULT = 1;
+pub const RPC_E_CHANGED_MODE: HRESULT = 0x8001_0106u32 as HRESULT;
+pub const COINIT_APARTMENTTHREADED: DWORD = 0x2;
+pub const CLSCTX_INPROC_SERVER: DWORD = 0x1;
+pub const STGM_READ: DWORD = 0;
+
+/// The shell's link object.
+pub const CLSID_SHELL_LINK: GUID = GUID {
+    Data1: 0x0002_1401,
+    Data2: 0,
+    Data3: 0,
+    Data4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46],
+};
+pub const IID_ISHELL_LINK_W: GUID = GUID {
+    Data1: 0x0002_14f9,
+    Data2: 0,
+    Data3: 0,
+    Data4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46],
+};
+pub const IID_IPERSIST_FILE: GUID = GUID {
+    Data1: 0x0000_010b,
+    Data2: 0,
+    Data3: 0,
+    Data4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46],
+};
+
+/// The three methods every COM interface starts with.
+#[repr(C)]
+pub struct IUnknownVtbl {
+    pub QueryInterface:
+        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    pub AddRef: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub Release: unsafe extern "system" fn(*mut c_void) -> u32,
+}
+
+/// `IShellLinkW`. Slots the program never calls are kept as bare pointers
+/// so the used ones sit at their real offsets.
+#[repr(C)]
+pub struct IShellLinkWVtbl {
+    pub base: IUnknownVtbl,
+    pub GetPath: unsafe extern "system" fn(*mut c_void, *mut u16, i32, *mut c_void, DWORD) -> HRESULT,
+    pub GetIDList: *const c_void,
+    pub SetIDList: *const c_void,
+    pub GetDescription: *const c_void,
+    pub SetDescription: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+    pub GetWorkingDirectory: *const c_void,
+    pub SetWorkingDirectory: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+    pub GetArguments: unsafe extern "system" fn(*mut c_void, *mut u16, i32) -> HRESULT,
+    pub SetArguments: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+    pub GetHotkey: *const c_void,
+    pub SetHotkey: *const c_void,
+    pub GetShowCmd: *const c_void,
+    pub SetShowCmd: *const c_void,
+    pub GetIconLocation: *const c_void,
+    pub SetIconLocation: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> HRESULT,
+    pub SetRelativePath: *const c_void,
+    pub Resolve: *const c_void,
+    pub SetPath: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+}
+
+/// `IPersistFile`, which the link object also implements.
+#[repr(C)]
+pub struct IPersistFileVtbl {
+    pub base: IUnknownVtbl,
+    pub GetClassID: *const c_void,
+    pub IsDirty: *const c_void,
+    pub Load: unsafe extern "system" fn(*mut c_void, *const u16, DWORD) -> HRESULT,
+    pub Save: unsafe extern "system" fn(*mut c_void, *const u16, BOOL) -> HRESULT,
+    pub SaveCompleted: *const c_void,
+    pub GetCurFile: *const c_void,
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    pub fn CoInitializeEx(pvReserved: *mut c_void, dwCoInit: DWORD) -> HRESULT;
+    pub fn CoUninitialize();
+    pub fn CoCreateInstance(
+        rclsid: *const GUID,
+        pUnkOuter: *mut c_void,
+        dwClsContext: DWORD,
+        riid: *const GUID,
+        ppv: *mut *mut c_void,
+    ) -> HRESULT;
+}

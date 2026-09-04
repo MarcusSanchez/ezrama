@@ -702,6 +702,7 @@ fn spawn_watcher(watcher: &std::path::Path) -> Result<u32, crate::usbprint::WinE
 #[cfg(windows)]
 fn install() -> ExitCode {
     use crate::install::*;
+    use crate::shortcut;
 
     let Some(directory) = install_dir() else {
         eprintln!("LOCALAPPDATA is not set; cannot choose an installation directory");
@@ -736,12 +737,34 @@ fn install() -> ExitCode {
     } else {
         println!("already running from {}", directory.display());
     }
-    match write_icon(&directory) {
-        Ok(path) => println!("wrote {}", path.display()),
+    let icon = match write_icon(&directory) {
+        Ok(path) => {
+            println!("wrote {}", path.display());
+            path
+        }
         Err(error) => {
             eprintln!("cannot write the icon file: {error}");
             return ExitCode::from(1);
         }
+    };
+    match shortcut::start_menu_path() {
+        Some(link) => {
+            let written = shortcut::write(
+                &link,
+                &installed_watcher,
+                "watch",
+                &icon,
+                "Keeps the Panorama SE showing its media",
+            );
+            match written {
+                Ok(()) => println!("Start Menu entry {}", link.display()),
+                Err(error) => {
+                    eprintln!("cannot write the Start Menu entry: {error}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        None => println!("APPDATA is not set; no Start Menu entry"),
     }
 
     let command = run_command(&installed_watcher);
@@ -782,6 +805,7 @@ fn install() -> ExitCode {
 fn uninstall() -> ExitCode {
     use crate::install::*;
     use crate::log::default_log_path;
+    use crate::shortcut;
 
     if stop_watcher_and_wait() {
         println!("stopped the running watcher");
@@ -799,6 +823,16 @@ fn uninstall() -> ExitCode {
         return ExitCode::from(1);
     };
     let mut failed = false;
+    if let Some(link) = shortcut::start_menu_path() {
+        match std::fs::remove_file(&link) {
+            Ok(()) => println!("removed the Start Menu entry"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!("cannot remove {}: {error}", link.display());
+                failed = true;
+            }
+        }
+    }
     for name in [CONSOLE_BINARY, WATCHER_BINARY, ICON_FILE] {
         let path = directory.join(name);
         match std::fs::remove_file(&path) {
@@ -827,6 +861,7 @@ fn uninstall() -> ExitCode {
 fn status() -> ExitCode {
     use crate::window;
     use crate::install::*;
+    use crate::shortcut;
     use crate::usbprint::{self, Discovery};
 
     match install_dir() {
@@ -845,6 +880,10 @@ fn status() -> ExitCode {
         Ok(Some(command)) => println!("logon entry  {command}"),
         Ok(None) => println!("logon entry  none"),
         Err(error) => println!("logon entry  unreadable: {error}"),
+    }
+    match shortcut::start_menu_path() {
+        Some(link) if link.exists() => println!("start menu   {}", link.display()),
+        _ => println!("start menu   none"),
     }
     match kanali_run_entries() {
         Ok(entries) if entries.is_empty() => println!("kanali       no startup entry"),

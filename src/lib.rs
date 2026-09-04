@@ -19,6 +19,8 @@ pub mod launcher;
 #[cfg(windows)]
 pub mod overlapped;
 #[cfg(windows)]
+pub mod shortcut;
+#[cfg(windows)]
 pub mod tray;
 #[cfg(windows)]
 pub mod usbprint;
