@@ -122,6 +122,12 @@ pub fn read_run_value(name: &str) -> Result<Option<String>, WinError> {
 /// Reads the string value `name` under `subkey` of `root`. A missing key
 /// or value is `None`.
 pub fn read_string(root: HKEY, subkey: &str, name: &str) -> Result<Option<String>, WinError> {
+    Ok(read_string_raw(root, subkey, name)?.map(|(kind, bytes)| registry_string(kind, &bytes)))
+}
+
+/// Reads the value `name` under `subkey` of `root` as stored: its type and
+/// its bytes. A missing key or value is `None`.
+fn read_string_raw(root: HKEY, subkey: &str, name: &str) -> Result<Option<(DWORD, Vec<u8>)>, WinError> {
     let key = match open_key(root, subkey, KEY_QUERY_VALUE) {
         Ok(key) => key,
         Err(error) if error.code == ERROR_FILE_NOT_FOUND => return Ok(None),
@@ -170,7 +176,8 @@ pub fn read_string(root: HKEY, subkey: &str, name: &str) -> Result<Option<String
             code: status as DWORD,
         });
     }
-    Ok(Some(registry_string(kind, &data[..size as usize])))
+    data.truncate(size as usize);
+    Ok(Some((kind, data)))
 }
 
 /// A string value as stored: expandable strings have their `%NAME%`
@@ -201,6 +208,137 @@ pub fn expand_environment(text: &str) -> String {
     }
     let end = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..end])
+}
+
+/// Registry key holding the current user's environment variables.
+pub const ENVIRONMENT_KEY: &str = "Environment";
+/// The user's search path value under [`ENVIRONMENT_KEY`].
+pub const PATH_VALUE: &str = "Path";
+
+/// Whether two search path entries name the same directory: case does not
+/// matter and neither does a trailing separator.
+fn same_directory(a: &str, b: &str) -> bool {
+    let trim = |s: &str| s.trim().trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    trim(a) == trim(b)
+}
+
+/// `current` with `directory` appended, or `None` when it is already
+/// there.
+pub fn path_with(current: &str, directory: &str) -> Option<String> {
+    if current.split(';').any(|entry| same_directory(entry, directory)) {
+        return None;
+    }
+    let trimmed = current.trim_end_matches(';');
+    if trimmed.is_empty() {
+        Some(directory.to_string())
+    } else {
+        Some(format!("{trimmed};{directory}"))
+    }
+}
+
+/// `current` without `directory`, or `None` when it was not there.
+pub fn path_without(current: &str, directory: &str) -> Option<String> {
+    let kept: Vec<&str> = current
+        .split(';')
+        .filter(|entry| !entry.trim().is_empty() && !same_directory(entry, directory))
+        .collect();
+    let had = current.split(';').any(|entry| same_directory(entry, directory));
+    had.then(|| kept.join(";"))
+}
+
+fn set_string_of_kind(key: HKEY, name: &str, value: &str, kind: DWORD) -> Result<(), WinError> {
+    let name = wide(name);
+    let data = wide(value);
+    let status = unsafe {
+        RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            kind,
+            data.as_ptr() as *const u8,
+            (data.len() * 2) as DWORD,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(WinError {
+            call: "RegSetValueExW",
+            code: status as DWORD,
+        });
+    }
+    Ok(())
+}
+
+/// Tells open programs the environment changed, so a new terminal sees
+/// the new search path.
+fn announce_environment_change() {
+    let what = wide(ENVIRONMENT_KEY);
+    let mut result: usize = 0;
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            what.as_ptr() as LPARAM,
+            SMTO_ABORTIFHUNG,
+            1000,
+            &mut result,
+        );
+    }
+}
+
+/// Rewrites the user's search path value `name` through `edit`, keeping
+/// the value's type and leaving `%NAME%` references unexpanded. Returns
+/// whether anything changed.
+pub fn edit_user_path(name: &str, edit: impl FnOnce(&str) -> Option<String>) -> Result<bool, WinError> {
+    let (kind, current) = match read_string_raw(HKEY_CURRENT_USER, ENVIRONMENT_KEY, name)? {
+        Some((kind, bytes)) => (kind, utf16_string(&bytes)),
+        None => (REG_EXPAND_SZ, String::new()),
+    };
+    let Some(updated) = edit(&current) else {
+        return Ok(false);
+    };
+    let key = open_key(HKEY_CURRENT_USER, ENVIRONMENT_KEY, KEY_SET_VALUE)?;
+    let written = if updated.is_empty() {
+        let value_name = wide(name);
+        let status = unsafe { RegDeleteValueW(key, value_name.as_ptr()) };
+        if status != ERROR_SUCCESS && status as DWORD != ERROR_FILE_NOT_FOUND {
+            Err(WinError {
+                call: "RegDeleteValueW",
+                code: status as DWORD,
+            })
+        } else {
+            Ok(())
+        }
+    } else {
+        set_string_of_kind(key, name, &updated, kind)
+    };
+    unsafe { RegCloseKey(key) };
+    written?;
+    announce_environment_change();
+    Ok(true)
+}
+
+/// Adds `directory` to the user's search path. Returns whether it was
+/// added rather than already there.
+pub fn add_to_user_path(directory: &Path) -> Result<bool, WinError> {
+    let directory = directory.to_string_lossy();
+    edit_user_path(PATH_VALUE, |current| path_with(current, &directory))
+}
+
+/// Removes `directory` from the user's search path. Returns whether it
+/// was there.
+pub fn remove_from_user_path(directory: &Path) -> Result<bool, WinError> {
+    let directory = directory.to_string_lossy();
+    edit_user_path(PATH_VALUE, |current| path_without(current, &directory))
+}
+
+/// Whether the user's search path lists `directory`.
+pub fn user_path_has(directory: &Path) -> Result<bool, WinError> {
+    let current = read_string_raw(HKEY_CURRENT_USER, ENVIRONMENT_KEY, PATH_VALUE)?
+        .map(|(_, bytes)| utf16_string(&bytes))
+        .unwrap_or_default();
+    let directory = directory.to_string_lossy();
+    Ok(path_with(&current, &directory).is_none())
 }
 
 /// Writes the string value `name` under the Run key.
@@ -514,6 +652,38 @@ mod tests {
         let bytes: Vec<u8> = "%SystemRoot%".encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert_eq!(registry_string(REG_EXPAND_SZ, &bytes), root);
         assert_eq!(registry_string(REG_SZ, &bytes), "%SystemRoot%");
+    }
+
+    #[test]
+    fn search_path_edits_are_case_blind_and_separator_tolerant() {
+        assert_eq!(path_with("", r"C:\a"), Some(r"C:\a".to_string()));
+        assert_eq!(path_with(r"C:\x;", r"C:\a"), Some(r"C:\x;C:\a".to_string()));
+        assert_eq!(path_with(r"C:\x;c:\A\", r"C:\a"), None);
+        assert_eq!(path_with(r"%SystemRoot%;C:\x", r"C:\a"), Some(r"%SystemRoot%;C:\x;C:\a".to_string()));
+        assert_eq!(path_without(r"C:\x;C:\a;C:\y", r"c:\a\"), Some(r"C:\x;C:\y".to_string()));
+        assert_eq!(path_without(r"C:\a", r"C:\a"), Some(String::new()));
+        assert_eq!(path_without(r"C:\x;;C:\y", r"C:\a"), None);
+        assert_eq!(path_without("", r"C:\a"), None);
+    }
+
+    #[test]
+    fn a_search_path_value_round_trips_with_its_type_unexpanded() {
+        let name = format!("ezrama-path-test-{}", std::process::id());
+        let directory = Path::new(r"C:\ezrama-test\bin");
+        let value = |name: &str| read_string_raw(HKEY_CURRENT_USER, ENVIRONMENT_KEY, name).unwrap();
+        assert_eq!(value(&name), None);
+        assert_eq!(edit_user_path(&name, |current| path_with(current, r"%SystemRoot%\x")), Ok(true));
+        let (kind, bytes) = value(&name).unwrap();
+        assert_eq!(kind, REG_EXPAND_SZ);
+        assert_eq!(utf16_string(&bytes), r"%SystemRoot%\x");
+        let text = directory.to_string_lossy();
+        assert_eq!(edit_user_path(&name, |current| path_with(current, &text)), Ok(true));
+        assert_eq!(edit_user_path(&name, |current| path_with(current, &text)), Ok(false));
+        assert_eq!(utf16_string(&value(&name).unwrap().1), format!(r"%SystemRoot%\x;{text}"));
+        assert_eq!(edit_user_path(&name, |current| path_without(current, &text)), Ok(true));
+        assert_eq!(utf16_string(&value(&name).unwrap().1), r"%SystemRoot%\x");
+        assert_eq!(edit_user_path(&name, |current| path_without(current, r"%SystemRoot%\x")), Ok(true));
+        assert_eq!(value(&name), None, "an emptied value is deleted");
     }
 
     #[test]

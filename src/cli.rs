@@ -799,6 +799,11 @@ fn install() -> ExitCode {
             return ExitCode::from(1);
         }
     }
+    match add_to_user_path(&directory) {
+        Ok(true) => println!("added {} to your PATH; new terminals can run {NAME} by name", directory.display()),
+        Ok(false) => println!("{} is already on your PATH", directory.display()),
+        Err(error) => println!("could not add {} to your PATH: {error}", directory.display()),
+    }
 
     match kanali_run_entries() {
         Ok(entries) if !entries.is_empty() => {
@@ -865,6 +870,14 @@ fn uninstall() -> ExitCode {
         Ok(false) => {}
         Err(error) => {
             eprintln!("cannot remove the Settings entry: {error}");
+            failed = true;
+        }
+    }
+    match remove_from_user_path(&directory) {
+        Ok(true) => println!("removed {} from your PATH", directory.display()),
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("cannot remove {} from your PATH: {error}", directory.display());
             failed = true;
         }
     }
@@ -950,6 +963,13 @@ fn status() -> ExitCode {
         Ok(Some(command)) => println!("settings     listed; uninstall runs {command}"),
         Ok(None) => println!("settings     not listed"),
         Err(error) => println!("settings     unreadable: {error}"),
+    }
+    if let Some(directory) = install_dir() {
+        match user_path_has(&directory) {
+            Ok(true) => println!("path         {} is on your PATH", directory.display()),
+            Ok(false) => println!("path         not on your PATH"),
+            Err(error) => println!("path         unreadable: {error}"),
+        }
     }
     match kanali_run_entries() {
         Ok(entries) if entries.is_empty() => println!("kanali       no startup entry"),

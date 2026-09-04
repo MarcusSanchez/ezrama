@@ -402,6 +402,9 @@ pub const TPM_NONOTIFY: DWORD = 0x0080;
 pub const TPM_RETURNCMD: DWORD = 0x0100;
 
 pub const SMTO_ABORTIFHUNG: DWORD = 0x0002;
+pub const WM_SETTINGCHANGE: u32 = 0x001a;
+/// Message target that reaches every top-level window.
+pub const HWND_BROADCAST: HWND = 0xffffusize as HWND;
 
 pub const DIB_RGB_COLORS: DWORD = 0;
 pub const BI_RGB: DWORD = 0;

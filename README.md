@@ -16,11 +16,12 @@ target\release\ezrama.exe install
 ```
 
 This copies the program to `%LOCALAPPDATA%\ezrama`, starts it, and adds
-three things: a logon entry so it starts with Windows, a Start Menu entry
-named ezrama for getting it back after a Quit, and an entry under
-Settings > Apps whose Uninstall removes everything again. Turn off "start
-with Windows" in KANALI's own settings, or the two race for the panel at
-logon.
+four things: a logon entry so it starts with Windows, a Start Menu entry
+named ezrama for getting it back after a Quit, an entry under
+Settings > Apps whose Uninstall removes everything again, and the folder
+on your PATH so `ezrama` works by name in any new terminal. Turn off
+"start with Windows" in KANALI's own settings, or the two race for the
+panel at logon.
 
 While it runs, ezrama sits in the notification area. Its menu shows the
 current status and offers Pause, Resume, Open KANALI, a Start with Windows
