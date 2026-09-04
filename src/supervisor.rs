@@ -67,8 +67,6 @@ pub trait Backend {
     /// Starts KANALI, arranging for [`Event::KanaliClosed`] once it has
     /// exited. False when it could not be started.
     fn start_kanali(&mut self, log: &mut Logger) -> bool;
-    /// Turns the logon entry on or off, logging the outcome.
-    fn set_startup(&mut self, enabled: bool, log: &mut Logger);
 }
 
 /// Keeps a session whenever the display is present, releases it on
@@ -138,7 +136,14 @@ impl<B: Backend> Supervisor<B> {
             Event::Resume => self.log.log("resume requested"),
             Event::OpenKanali => self.log.log("KANALI requested"),
             Event::KanaliClosed => self.log.log("KANALI has exited"),
-            Event::SetStartup(enabled) => self.backend.set_startup(*enabled, &mut self.log),
+            Event::StartupSet { enabled, result } => {
+                let wording = if *enabled { "on" } else { "off" };
+                self.log.log(&match result {
+                    Ok(true) => format!("start with Windows turned {wording}"),
+                    Ok(false) => format!("start with Windows was already {wording}"),
+                    Err(reason) => format!("start with Windows not changed: {reason}"),
+                });
+            }
             Event::Quit => self.log.log("stop requested"),
         }
         self.control.apply(&event)
@@ -366,10 +371,6 @@ mod tests {
             self.calls.push("launch".into());
             self.launches.pop_front().expect("the script has no more launches")
         }
-
-        fn set_startup(&mut self, enabled: bool, _log: &mut Logger) {
-            self.calls.push(format!("startup {enabled}"));
-        }
     }
 
     const INTERVAL: Duration = Duration::from_millis(4500);
@@ -593,20 +594,23 @@ mod tests {
     }
 
     #[test]
-    fn a_startup_toggle_reaches_the_machine_without_changing_the_mode() {
+    fn a_startup_change_is_only_logged_and_changes_no_mode() {
         let (sender, events) = mpsc::channel();
+        let set = |enabled: bool, result: Result<bool, String>| Event::StartupSet { enabled, result };
         let fake = Fake::new(sender)
             .panel(one())
             .start(Ok(()))
             .then(vec![])
-            .then(vec![Event::SetStartup(false), Event::SetStartup(true), Event::Quit])
+            .then(vec![
+                set(false, Ok(true)),
+                set(true, Ok(false)),
+                set(true, Err("denied".into())),
+                Event::Quit,
+            ])
             .hold(Hold::Stopped { pings: 1 });
         let fake = run(fake, &events);
         assert_eq!(fake.states, [State::Connecting, State::Active, State::Quitting]);
-        assert_eq!(
-            fake.calls,
-            ["find", "start panel", "hold 4500", "startup false", "startup true"]
-        );
+        assert_eq!(fake.calls, ["find", "start panel", "hold 4500"]);
     }
 
     #[test]

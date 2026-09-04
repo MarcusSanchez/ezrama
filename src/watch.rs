@@ -24,8 +24,12 @@ pub enum Event {
     OpenKanali,
     /// The KANALI started on request has exited.
     KanaliClosed,
-    /// Turn the logon entry on or off.
-    SetStartup(bool),
+    /// The logon entry was switched from the menu: what was asked for and
+    /// whether the registry changed, or why not.
+    StartupSet {
+        enabled: bool,
+        result: Result<bool, String>,
+    },
     /// The watcher should release the display and exit.
     Quit,
 }
@@ -169,7 +173,7 @@ impl Control {
                 self.launch_pending = false;
             }
             Event::Quit => return Directive::Quit,
-            Event::Arrived(_) | Event::Removed(_) | Event::SetStartup(_) => {}
+            Event::Arrived(_) | Event::Removed(_) | Event::StartupSet { .. } => {}
         }
         Directive::Continue
     }
@@ -302,7 +306,11 @@ mod tests {
         assert!(!Event::Arrived("a".into()).interrupts());
         assert!(!Event::Resume.interrupts());
         assert!(!Event::KanaliClosed.interrupts());
-        assert!(!Event::SetStartup(true).interrupts());
+        let set = Event::StartupSet {
+            enabled: true,
+            result: Ok(true),
+        };
+        assert!(!set.interrupts());
     }
 
     #[test]

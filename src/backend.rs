@@ -6,7 +6,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::hold::{hold, HoldEvent, KEEPALIVE_WRITE_RETRIES};
-use crate::install;
 use crate::launcher;
 use crate::log::Logger;
 use crate::overlapped::UsbprintTransport;
@@ -230,15 +229,6 @@ impl Backend for WindowsBackend {
             Ok(()) => Hold::Stopped { pings },
             Err(error) if interrupted(&error) => Hold::Stopped { pings },
             Err(error) => Hold::Lost { pings, error },
-        }
-    }
-
-    fn set_startup(&mut self, enabled: bool, log: &mut Logger) {
-        let wording = if enabled { "on" } else { "off" };
-        match install::set_startup(enabled) {
-            Ok(true) => log.log(&format!("start with Windows turned {wording}")),
-            Ok(false) => log.log(&format!("start with Windows was already {wording}")),
-            Err(error) => log.log(&format!("start with Windows not changed: {error}")),
         }
     }
 

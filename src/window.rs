@@ -348,7 +348,11 @@ fn show_menu(window: HWND) {
         Some(MenuChoice::Pause) => post_event(Event::Pause),
         Some(MenuChoice::Resume) => post_event(Event::Resume),
         Some(MenuChoice::OpenKanali) => post_event(Event::OpenKanali),
-        Some(MenuChoice::ToggleStartup) => post_event(Event::SetStartup(!facts.startup)),
+        Some(MenuChoice::ToggleStartup) => {
+            let enabled = !facts.startup;
+            let result = install::set_startup(enabled).map_err(|error| error.to_string());
+            post_event(Event::StartupSet { enabled, result });
+        }
         Some(MenuChoice::Quit) => quit(),
         None => {}
     }
