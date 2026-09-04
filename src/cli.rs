@@ -20,8 +20,9 @@ Commands:
   kanali     Ask the running watcher to release the panel, start KANALI, and
              take the panel back once KANALI exits
   stop       Ask the running watcher to exit
-  install    Copy the binaries to local app data, add the logon, Start Menu,
-             and Settings entries, and start the watcher
+  install    Copy the program to local app data, add the logon, Start Menu,
+             Settings, and PATH entries, and start the watcher; also what
+             a double-click does
   uninstall  Stop the watcher and remove everything install added
   status     Report the installation, the watcher, and the panel
   help       Show this message
@@ -111,11 +112,47 @@ fn dispatch(args: &[String]) -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
+        None if owns_console() => install_by_hand(),
         None => {
             eprint!("{USAGE}");
             ExitCode::from(2)
         }
     }
+}
+
+/// Whether this process is the only one attached to its console, which is
+/// how a console program started from Explorer or a shortcut finds itself:
+/// its window closes the moment it exits.
+#[cfg(windows)]
+fn owns_console() -> bool {
+    use crate::win::GetConsoleProcessList;
+    let mut ids = [0u32; 2];
+    unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) == 1 }
+}
+
+#[cfg(not(windows))]
+fn owns_console() -> bool {
+    false
+}
+
+/// Runs `install` for someone who double-clicked the program, and keeps
+/// the window open until they have read the result.
+fn install_by_hand() -> ExitCode {
+    println!("{NAME} {VERSION}: installing for the current user");
+    println!();
+    let outcome = install();
+    println!();
+    if outcome == ExitCode::SUCCESS {
+        println!("Done. The icon is in the notification area, and Windows will start");
+        println!("{NAME} at logon. Remove it from Settings > Apps.");
+    } else {
+        println!("Installation did not finish; see the messages above.");
+    }
+    println!();
+    println!("Press Enter to close this window.");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    outcome
 }
 
 fn usage_error(message: &str) -> ExitCode {
@@ -712,10 +749,10 @@ fn install() -> ExitCode {
         eprintln!("LOCALAPPDATA is not set; cannot choose an installation directory");
         return ExitCode::from(1);
     };
-    let source_dir = match std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
-        Some(dir) => dir,
-        None => {
-            eprintln!("cannot locate this program's own directory");
+    let own = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("cannot locate this program: {error}");
             return ExitCode::from(1);
         }
     };
@@ -726,20 +763,26 @@ fn install() -> ExitCode {
         println!("stopped the running watcher");
     }
 
-    if source_dir != directory {
-        for name in [CONSOLE_BINARY, WATCHER_BINARY] {
-            let source = source_dir.join(name);
-            let destination = directory.join(name);
-            match copy_binary(&source, &destination) {
-                Ok(bytes) => println!("copied {name} to {} ({bytes} bytes)", directory.display()),
-                Err(error) => {
-                    eprintln!("cannot copy {} to {}: {error}", source.display(), destination.display());
-                    return ExitCode::from(1);
-                }
+    let already_installed = own
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&installed_console.to_string_lossy());
+    if already_installed {
+        println!("already running from {}", directory.display());
+    } else {
+        match copy_binary(&own, &installed_console) {
+            Ok(bytes) => println!("copied {CONSOLE_BINARY} to {} ({bytes} bytes)", directory.display()),
+            Err(error) => {
+                eprintln!("cannot copy {} to {}: {error}", own.display(), installed_console.display());
+                return ExitCode::from(1);
             }
         }
-    } else {
-        println!("already running from {}", directory.display());
+    }
+    match write_watcher(&installed_console) {
+        Ok(path) => println!("wrote {} (the same program without a console)", path.display()),
+        Err(error) => {
+            eprintln!("cannot write {WATCHER_BINARY}: {error}");
+            return ExitCode::from(1);
+        }
     }
     let icon = match write_icon(&directory) {
         Ok(path) => {

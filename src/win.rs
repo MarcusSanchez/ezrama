@@ -364,6 +364,7 @@ extern "system" {
     pub fn SetConsoleCtrlHandler(HandlerRoutine: PHANDLER_ROUTINE, Add: BOOL) -> BOOL;
     pub fn GetModuleHandleW(lpModuleName: *const u16) -> HANDLE;
     pub fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
+    pub fn GetConsoleProcessList(lpdwProcessList: *mut DWORD, dwProcessCount: DWORD) -> DWORD;
     pub fn ExpandEnvironmentStringsW(lpSrc: *const u16, lpDst: *mut u16, nSize: DWORD) -> DWORD;
     pub fn OpenEventW(dwDesiredAccess: DWORD, bInheritHandle: BOOL, lpName: *const u16) -> HANDLE;
     pub fn SetEvent(hEvent: HANDLE) -> BOOL;

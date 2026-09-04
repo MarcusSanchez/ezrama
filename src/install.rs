@@ -485,6 +485,63 @@ pub fn copy_binary(source: &Path, destination: &Path) -> std::io::Result<u64> {
     fs::copy(source, destination)
 }
 
+/// Subsystem value of a program that runs without a console.
+const SUBSYSTEM_WINDOWS_GUI: u16 = 2;
+/// Offset of the subsystem field within a 64-bit optional header.
+const OPTIONAL_HEADER_SUBSYSTEM: usize = 68;
+/// Offset of the checksum field within a 64-bit optional header.
+const OPTIONAL_HEADER_CHECKSUM: usize = 64;
+/// Magic number of a 64-bit optional header.
+const OPTIONAL_HEADER_MAGIC_PE32_PLUS: u16 = 0x20b;
+
+/// The console program `image` rewritten to run without a console: the
+/// same code and data with the subsystem field set to the windowed value
+/// and the checksum cleared, which is what the windowless twin of a
+/// console build differs in.
+pub fn windowless_image(image: &[u8]) -> Result<Vec<u8>, String> {
+    let field = |offset: usize| -> Result<u16, String> {
+        let bytes = image
+            .get(offset..offset + 2)
+            .ok_or_else(|| "the image is too short".to_string())?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    if image.get(..2) != Some(b"MZ") {
+        return Err("not a Windows executable".to_string());
+    }
+    let header = u32::from_le_bytes(
+        image
+            .get(60..64)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| "the image is too short".to_string())?,
+    ) as usize;
+    if image.get(header..header + 4) != Some(b"PE\0\0") {
+        return Err("no executable header".to_string());
+    }
+    let optional = header + 24;
+    if field(optional)? != OPTIONAL_HEADER_MAGIC_PE32_PLUS {
+        return Err("not a 64-bit executable".to_string());
+    }
+    let subsystem = optional + OPTIONAL_HEADER_SUBSYSTEM;
+    let checksum = optional + OPTIONAL_HEADER_CHECKSUM;
+    if image.len() < subsystem + 2 {
+        return Err("the image is too short".to_string());
+    }
+    let mut out = image.to_vec();
+    out[subsystem..subsystem + 2].copy_from_slice(&SUBSYSTEM_WINDOWS_GUI.to_le_bytes());
+    out[checksum..checksum + 4].copy_from_slice(&0u32.to_le_bytes());
+    Ok(out)
+}
+
+/// Writes the windowless twin of the program at `console` as
+/// [`WATCHER_BINARY`] next to it.
+pub fn write_watcher(console: &Path) -> std::io::Result<PathBuf> {
+    let image = fs::read(console)?;
+    let windowless = windowless_image(&image).map_err(std::io::Error::other)?;
+    let path = console.with_file_name(WATCHER_BINARY);
+    fs::write(&path, windowless)?;
+    Ok(path)
+}
+
 /// Registry key whose subkeys are the current user's installed programs,
 /// as Settings lists them.
 pub const UNINSTALL_ROOT: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall";
@@ -652,6 +709,49 @@ mod tests {
         let bytes: Vec<u8> = "%SystemRoot%".encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert_eq!(registry_string(REG_EXPAND_SZ, &bytes), root);
         assert_eq!(registry_string(REG_SZ, &bytes), "%SystemRoot%");
+    }
+
+    /// A minimal 64-bit image: DOS stub, PE signature, COFF header, and an
+    /// optional header with the console subsystem and a checksum.
+    fn console_image() -> Vec<u8> {
+        let header = 128usize;
+        let mut image = vec![0u8; header + 4 + 20 + 240];
+        image[..2].copy_from_slice(b"MZ");
+        image[60..64].copy_from_slice(&(header as u32).to_le_bytes());
+        image[header..header + 4].copy_from_slice(b"PE\0\0");
+        let optional = header + 24;
+        image[optional..optional + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        image[optional + 64..optional + 68].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        image[optional + 68..optional + 70].copy_from_slice(&3u16.to_le_bytes());
+        image
+    }
+
+    #[test]
+    fn a_console_image_becomes_windowless_by_two_fields() {
+        let image = console_image();
+        let windowless = windowless_image(&image).unwrap();
+        assert_eq!(windowless.len(), image.len());
+        let optional = 128 + 24;
+        assert_eq!(&windowless[optional + 68..optional + 70], &2u16.to_le_bytes());
+        assert_eq!(&windowless[optional + 64..optional + 68], &0u32.to_le_bytes());
+        let differing = windowless.iter().zip(&image).filter(|(a, b)| a != b).count();
+        assert_eq!(differing, 5, "only the subsystem byte and the four checksum bytes change");
+        assert!(windowless_image(b"MZ").is_err());
+        assert!(windowless_image(b"not an image at all, but long enough to read a header from").is_err());
+        let mut wrong_magic = image.clone();
+        wrong_magic[optional..optional + 2].copy_from_slice(&0x10bu16.to_le_bytes());
+        assert_eq!(windowless_image(&wrong_magic), Err("not a 64-bit executable".to_string()));
+    }
+
+    #[test]
+    fn this_program_can_be_made_windowless() {
+        let own = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let windowless = windowless_image(&own).unwrap();
+        assert_eq!(windowless.len(), own.len());
+        let header = u32::from_le_bytes(own[60..64].try_into().unwrap()) as usize;
+        let optional = header + 24;
+        assert_eq!(&own[optional + 68..optional + 70], &3u16.to_le_bytes(), "tests run as a console program");
+        assert_eq!(&windowless[optional + 68..optional + 70], &2u16.to_le_bytes());
     }
 
     #[test]
